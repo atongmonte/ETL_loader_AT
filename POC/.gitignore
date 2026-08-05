@@ -5,4 +5,6 @@ venv/
 .env
 .env.*
 !.env.example
+etl_config.yaml
+etl_config.local.yaml
 *.log

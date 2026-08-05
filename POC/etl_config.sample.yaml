@@ -1,0 +1,70 @@
+# Safe sample configuration. Do not put real server names, file shares,
+# credentials, email addresses, or production table names in this file.
+version: 1
+
+default_destination:
+  connection:
+    dialect: mssql+pyodbc
+    driver: ODBC Driver 17 for SQL Server
+    server: "${DEST_SQL_SERVER:-YOUR_SQL_SERVER}"
+    database: "${DEST_SQL_DATABASE:-YOUR_DATABASE}"
+    auth:
+      mode: trusted
+      # SQL authentication example:
+      # mode: sql_password
+      # username: "${DEST_SQL_USERNAME}"
+      # password: "${DEST_SQL_PASSWORD}"
+    encrypt: true
+    trust_server_certificate: false
+  staging_schema: STG
+  staging_load_mode: truncate_append
+  batch_size: 10000
+  allow_empty: false
+
+# Health rows use the same effective connection as each loader.
+health:
+  enabled: false
+  schema: dbo
+  table: etl_health
+  auto_create: false
+  required: false
+
+email:
+  enabled: false
+  required: false
+  tenant_id: "${GRAPH_TENANT_ID:-}"
+  client_id: "${GRAPH_CLIENT_ID:-}"
+  client_secret: "${GRAPH_CLIENT_SECRET:-}"
+  sender: "${GRAPH_SENDER:-}"
+  recipients: []
+  cc: []
+  subject_prefix: Sample ETL summary
+  timeout_seconds: 30
+  save_to_sent_items: false
+
+loaders:
+  - name: SampleDelimitedFile
+    enabled: true
+    source:
+      type: csv
+      path: '${SOURCE_FILE_PATH:-\\your-file-server\share\inbound\sample.txt}'
+      options:
+        sep: '|'
+        encoding: utf-8-sig
+        dtype: string
+        keep_default_na: false
+        on_bad_lines: error
+
+    destination:
+      staging_table: SampleData_Stg
+
+    # Replace these examples with the source header, destination column,
+    # SQL type, and nullability required by your loader.
+    columns:
+      - {source: Source_ID, target: SourceID, type: "varchar(100)", nullable: false}
+      - {source: Description, target: Description, type: "varchar(500)", nullable: true}
+      - {source: Amount, target: Amount, type: "decimal(19,4)", nullable: true}
+      - {source: Effective_Date, target: EffectiveDate, type: date, nullable: true}
+
+    staging_to_prod:
+      mode: none

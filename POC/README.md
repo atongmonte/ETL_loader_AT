@@ -12,13 +12,14 @@ From this directory:
 
 ```powershell
 py -3.12 -m pip install -r .\requirements.txt
+Copy-Item .\etl_config.sample.yaml .\etl_config.yaml
 py -3.12 .\main_loader.py --config .\etl_config.yaml --validate-only
 py -3.12 .\main_loader.py --config .\etl_config.yaml
 ```
 
-The active configuration streams the pipe-delimited `CCX_Extract_MHS_07302026.txt` file from the Procurement UNC share into `[MISCDEVDB].[PRIME_DEV].[GHX].[_STG_ContractLineDetails]`. The extract is read and committed in 10,000-row chunks so the approximately 3.1 GB file is not held in memory.
+`etl_config.sample.yaml` contains placeholders only. Copy it to the Git-ignored `etl_config.yaml`, then put real server, database, source-file, and destination settings only in that local file or in environment variables.
 
-Before the first load, run `Create_GHX_STG_ContractLineDetails.sql` against `MISCDEVDB / PRIME_DEV`. The configured `truncate_append` mode requires the table to exist, truncates it once, and then appends each chunk while preserving the table definition and `LastUpdate` default.
+The `truncate_append` mode requires the staging table to exist, truncates it once, and then appends each chunk while preserving the table definition and database defaults.
 
 ## YAML behavior
 
