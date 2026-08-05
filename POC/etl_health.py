@@ -1,119 +1,147 @@
-"""Write loader start/finish records to the destination database."""
+"""Write loader lifecycle records through the ETL control framework."""
 
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
 
 _IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SOURCE_TYPES = {
+    "csv": "CSV",
+    "tsv": "CSV",
+    "excel": "EXCEL",
+    "sql": "DATABASE",
+    "json": "OTHER",
+    "parquet": "OTHER",
+}
 
 
-def _table_name(connection: Connection, config: dict[str, Any]) -> str:
-    schema = config.get("schema", "dbo")
-    table = config.get("table", "etl_health")
-    if not _IDENTIFIER.fullmatch(schema) or not _IDENTIFIER.fullmatch(table):
-        raise ValueError("Health schema and table must be simple SQL identifiers")
+def _procedure_name(connection: Connection, config: dict[str, Any], name: str) -> str:
+    schema = config.get("schema", "ETL")
+    if not _IDENTIFIER.fullmatch(schema):
+        raise ValueError("Health schema must be a simple SQL identifier")
     quote = connection.dialect.identifier_preparer.quote
-    return f"{quote(schema)}.{quote(table)}"
+    return f"{quote(schema)}.{quote(name)}"
 
 
-def _create_table_if_needed(connection: Connection, config: dict[str, Any]) -> None:
-    if not config.get("auto_create", False):
-        return
-    table = _table_name(connection, config)
-    object_name = f"{config.get('schema', 'dbo')}.{config.get('table', 'etl_health')}"
-    connection.execute(
-        text(
-            f"""
-IF OBJECT_ID(N'{object_name}', N'U') IS NULL
-BEGIN
-    CREATE TABLE {table} (
-        run_id uniqueidentifier NOT NULL,
-        loader_name nvarchar(200) NOT NULL,
-        target_table nvarchar(300) NOT NULL,
-        status varchar(20) NOT NULL,
-        started_at datetime2(3) NOT NULL,
-        finished_at datetime2(3) NULL,
-        rows_loaded bigint NOT NULL DEFAULT (0),
-        error_message nvarchar(2000) NULL,
-        PRIMARY KEY (run_id, loader_name)
-    );
-END
-"""
-        )
-    )
+def _source_object(source: dict[str, Any], config_dir: Path) -> str:
+    configured = source.get("path") or source.get("query") or source.get("object") or ""
+    if source.get("path") and not Path(configured).is_absolute():
+        configured = str(config_dir / configured)
+    return str(configured)[:500]
+
+
+def _target_identity(
+    health: dict[str, Any], destination: dict[str, Any], engine: Engine
+) -> tuple[str | None, str, str, str]:
+    connection = destination.get("connection", {})
+    target_server = health.get("target_server") or connection.get("server") or engine.url.host
+    target_database = health.get("target_database") or connection.get("database") or engine.url.database
+    target_schema = health.get("target_schema") or destination.get("staging_schema", "stg")
+    target_table = health.get("target_table") or destination["staging_table"]
+    if not target_database:
+        raise ValueError("ETL health requires target_database when it cannot be derived")
+    return target_server, target_database, target_schema, target_table
 
 
 def record_start(
     engine: Engine,
     health_config: dict[str, Any],
-    run_id: str,
-    loader_name: str,
-    target_table: str,
-    started_at: datetime,
-) -> None:
-    """Insert a RUNNING row using the loader's destination engine."""
+    loader: dict[str, Any],
+    destination: dict[str, Any],
+    config_dir: Path,
+) -> int | None:
+    """Open an ETL.RunHistory row and return its generated ETLRunID."""
 
     if not health_config.get("enabled", False):
-        return
+        return None
+    source = loader["source"]
+    source_type = health_config.get("source_type") or _SOURCE_TYPES.get(
+        source.get("type", "csv").lower(), "OTHER"
+    )
+    target_server, target_database, target_schema, target_table = _target_identity(
+        health_config, destination, engine
+    )
+    parameters = {
+        "JobName": loader["name"],
+        "JobDescription": health_config.get("job_description"),
+        "SourceType": source_type,
+        "SourceSystem": health_config.get("source_system"),
+        "SourceObject": health_config.get("source_object") or _source_object(source, config_dir),
+        "TargetServer": target_server,
+        "TargetDatabase": target_database,
+        "TargetSchema": target_schema,
+        "TargetTable": target_table,
+        "LoadType": health_config.get("load_type"),
+        "ParentETLRunID": health_config.get("parent_etl_run_id"),
+        "CreatedBy": health_config.get("created_by"),
+    }
     with engine.begin() as connection:
-        _create_table_if_needed(connection, health_config)
-        table = _table_name(connection, health_config)
-        connection.execute(
+        procedure = _procedure_name(connection, health_config, "usp_StartRun")
+        row = connection.execute(
             text(
                 f"""
-INSERT INTO {table}
-    (run_id, loader_name, target_table, status, started_at, rows_loaded)
-VALUES
-    (:run_id, :loader_name, :target_table, 'RUNNING', :started_at, 0)
+EXEC {procedure}
+    @JobName = :JobName,
+    @JobDescription = :JobDescription,
+    @SourceType = :SourceType,
+    @SourceSystem = :SourceSystem,
+    @SourceObject = :SourceObject,
+    @TargetServer = :TargetServer,
+    @TargetDatabase = :TargetDatabase,
+    @TargetSchema = :TargetSchema,
+    @TargetTable = :TargetTable,
+    @LoadType = :LoadType,
+    @ParentETLRunID = :ParentETLRunID,
+    @CreatedBy = :CreatedBy
 """
             ),
-            {
-                "run_id": run_id,
-                "loader_name": loader_name,
-                "target_table": target_table,
-                "started_at": started_at,
-            },
-        )
+            parameters,
+        ).mappings().one()
+    return int(row["ETLRunID"])
 
 
 def record_finish(
     engine: Engine,
     health_config: dict[str, Any],
-    run_id: str,
-    loader_name: str,
-    status: str,
-    finished_at: datetime,
-    rows_loaded: int,
-    error_message: str | None,
+    etl_run_id: int | None,
+    metrics: dict[str, Any],
 ) -> None:
-    """Update the matching health row after staging/production work ends."""
+    """Complete ETL.RunHistory with every usp_CompleteRun input."""
 
-    if not health_config.get("enabled", False):
+    if not health_config.get("enabled", False) or etl_run_id is None:
         return
+    parameters = {
+        "ETLRunID": etl_run_id,
+        "RowsReceived": metrics["rows_received"],
+        "RowsExtracted": metrics["rows_extracted"],
+        "RowsStaged": metrics["rows_staged"],
+        "RowsValid": metrics["rows_valid"],
+        "RowsInvalid": metrics.get("rows_invalid", 0),
+        "RowsExactDuplicate": metrics.get("rows_exact_duplicate", 0),
+        "RowsConflictingDuplicate": metrics.get("rows_conflicting_duplicate", 0),
+        "RowsAlreadyExist": metrics.get("rows_already_exist", 0),
+        "RowsInserted": metrics["rows_inserted"],
+        "RowsUpdated": metrics.get("rows_updated", 0),
+        "RowsDeleted": metrics.get("rows_deleted", 0),
+        "RowsUnchanged": metrics.get("rows_unchanged", 0),
+        "RowsRejected": metrics.get("rows_rejected", 0),
+        "RowsSkipped": metrics.get("rows_skipped", 0),
+        "BatchCount": metrics["batch_count"],
+        "FileCount": metrics["file_count"],
+        "RejectFilePath": metrics.get("reject_file_path"),
+        "DuplicateFilePath": metrics.get("duplicate_file_path"),
+        "LogFilePath": metrics.get("log_file_path"),
+        "RunStatus": metrics["run_status"],
+        "ErrorCode": metrics.get("error_code"),
+        "ErrorMessage": metrics.get("error_message"),
+        "ValidateReconciliation": metrics.get("validate_reconciliation", True),
+    }
+    assignments = ",\n    ".join(f"@{name} = :{name}" for name in parameters)
     with engine.begin() as connection:
-        table = _table_name(connection, health_config)
-        connection.execute(
-            text(
-                f"""
-UPDATE {table}
-SET status = :status,
-    finished_at = :finished_at,
-    rows_loaded = :rows_loaded,
-    error_message = :error_message
-WHERE run_id = :run_id AND loader_name = :loader_name
-"""
-            ),
-            {
-                "run_id": run_id,
-                "loader_name": loader_name,
-                "status": status,
-                "finished_at": finished_at,
-                "rows_loaded": rows_loaded,
-                "error_message": (error_message or "")[:2000] or None,
-            },
-        )
+        procedure = _procedure_name(connection, health_config, "usp_CompleteRun")
+        connection.execute(text(f"EXEC {procedure}\n    {assignments}"), parameters)

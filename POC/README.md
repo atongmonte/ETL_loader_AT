@@ -50,6 +50,17 @@ Console logs, run summaries, health records, and email timestamps use U.S. Easte
 
 Supported sources are `csv` (including delimited `.txt` files), `tsv`, `excel`, `json`, `parquet`, and `sql` query. CSV/TSV and SQL sources are streamed in `batch_size` chunks. Every loader supplies its column mapping and SQL type:
 
+For a file delivered daily, set `source.path` to its directory and use a Python-style date format in `filename_pattern`. The filename is resolved once at the start of the run in U.S. Eastern time and the same path is used for reading, ETL health, and archive/error movement:
+
+```yaml
+source:
+  type: csv
+  path: '\\server\share\inbound'
+  filename_pattern: 'CCX_Extract_MHS_{date:%m%d%Y}.txt'
+```
+
+On August 5, 2026, this resolves to `CCX_Extract_MHS_08052026.txt`. Omit `filename_pattern` when `path` already names a fixed file.
+
 ```yaml
 columns:
   - {source: ExternalId, target: customer_id, type: bigint, nullable: false}
@@ -95,20 +106,27 @@ staging_to_prod:
 
 Each staging chunk commits independently to avoid one extremely large SQL Server transaction. Production promotion runs only after every staging chunk succeeds. If a later staging chunk fails, production is not changed and the loader is reported as failed.
 
-## ETL health table
+## ETL health framework
 
-Health logging is off in the sample. Enable it with:
+Run `ETL_HEALTH_Scripts` 001 through 010 in numeric order in the destination database, then enable health logging with:
 
 ```yaml
 health:
   enabled: true
-  schema: dbo
-  table: etl_health
-  auto_create: true
-  required: false
+  schema: ETL
+  required: true
+  created_by: Procurement PMO ETL Loader
+
+loaders:
+  - name: ExampleLoader
+    health:
+      job_description: Load the source extract into staging
+      source_type: CSV
+      source_system: Source system name
+      load_type: FULL_REFRESH
 ```
 
-`auto_create: true` creates the simple table used by `etl_health.py`; the schema itself must already exist. Set `required: true` if a health-write failure should fail the loader.
+The loader calls `ETL.usp_StartRun` and retains its numeric `ETLRunID`, then calls `ETL.usp_CompleteRun` with every required reconciliation input: received, extracted, staged, valid, invalid, duplicate, inserted, updated, deleted, unchanged, rejected, and skipped rows; batch and file counts; output paths; final status; and error details. Source object and target server/database/schema/table are derived from the loader configuration unless explicitly overridden under `health`. The generated network log path is recorded in `ETL.RunHistory.LogFilePath`. Set `required: true` to prevent a data load from proceeding without its health record.
 
 ## Graph summary email
 
@@ -128,3 +146,6 @@ email:
 The script uses the client-credentials flow and calls `POST /v1.0/users/{sender}/sendMail`. Keep secrets out of YAML and source control. See Microsoft's [sendMail API](https://learn.microsoft.com/en-us/graph/api/user-sendmail?view=graph-rest-1.0) and [client-credentials flow](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow) documentation.
 
 Exit codes are `0` for success, `1` for a loader failure, `2` for a required email failure, and `3` for invalid configuration/startup.
+
+Every invocation also writes a timestamped log named `etl_loader_YYYYMMDD_HHMMSS_microseconds.log` to
+`\\montefiore.org\centralfiles\data\Procurement PMO\_Data\CCX\LOGS`. The loader exits with code `3` if the log directory cannot be accessed.

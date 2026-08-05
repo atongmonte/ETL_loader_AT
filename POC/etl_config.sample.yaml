@@ -17,13 +17,13 @@ default_destination:
   batch_size: 10000
   allow_empty: false
 
-# Health rows use the same effective connection as each loader.
+# Install ETL_HEALTH_Scripts 001-010 in the destination database first.
+# Health uses the same effective connection as each loader.
 health:
   enabled: false
-  schema: dbo
-  table: etl_health
-  auto_create: false
+  schema: ETL
   required: false
+  created_by: Sample ETL Loader
 
 email:
   enabled: false
@@ -42,9 +42,17 @@ email:
 loaders:
   - name: SampleDelimitedFile
     enabled: true
+    health:
+      job_description: Load the sample delimited file into staging
+      source_type: CSV
+      source_system: Sample Source System
+      # source_object and target identity are derived unless overridden here.
+      load_type: FULL_REFRESH
+      parent_etl_run_id: null
     source:
       type: csv
-      path: '\\your-file-server\share\inbound\sample.txt'
+      path: '\\your-file-server\share\inbound'
+      filename_pattern: 'sample_{date:%m%d%Y}.txt'
       file_move:
         success_directory: '\\your-file-server\share\archive'
         error_directory: '\\your-file-server\share\errors'

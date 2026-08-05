@@ -35,7 +35,19 @@ TYPE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 FILE_SOURCE_TYPES = {"csv", "tsv", "excel", "json", "parquet"}
+HEALTH_SOURCE_TYPES = {"CSV", "SNOWFLAKE", "DATABASE", "API", "EXCEL", "OTHER"}
+HEALTH_LOAD_TYPES = {
+    "INSERT_ONLY",
+    "UPSERT",
+    "FULL_REFRESH",
+    "SNAPSHOT",
+    "INCREMENTAL",
+    "DELETE_INSERT",
+}
 US_EASTERN = ZoneInfo("America/New_York")
+LOG_DIRECTORY = Path(
+    r"\\montefiore.org\centralfiles\data\Procurement PMO\_Data\CCX\LOGS"
+)
 
 
 class EasternFormatter(logging.Formatter):
@@ -44,6 +56,26 @@ class EasternFormatter(logging.Formatter):
     def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
         value = datetime.fromtimestamp(record.created, US_EASTERN)
         return value.strftime(datefmt) if datefmt else value.isoformat(timespec="milliseconds")
+
+
+def configure_logging(log_level: str) -> Path:
+    """Log to both the console and a timestamped file on the shared drive."""
+
+    LOG_DIRECTORY.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(US_EASTERN).strftime("%Y%m%d_%H%M%S_%f")
+    log_path = LOG_DIRECTORY / f"etl_loader_{timestamp}.log"
+    formatter = EasternFormatter("%(asctime)s %(levelname)s %(message)s")
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    logging.basicConfig(
+        level=getattr(logging, log_level),
+        handlers=[stream_handler, file_handler],
+        force=True,
+    )
+    return log_path
 
 
 def expand_environment(value: Any) -> Any:
@@ -149,12 +181,28 @@ def configured_path(value: str, config_dir: Path) -> Path:
     return path if path.is_absolute() else config_dir / path
 
 
+def resolved_source_path(source: dict[str, Any], config_dir: Path) -> Path:
+    """Resolve a fixed source path or render its date-based filename pattern."""
+
+    configured = configured_path(source["path"], config_dir)
+    pattern = source.get("filename_pattern")
+    if not pattern:
+        return configured
+    try:
+        filename = pattern.format(date=datetime.now(US_EASTERN))
+    except (KeyError, ValueError) as exc:
+        raise ValueError(f"Invalid source filename_pattern: {pattern}") from exc
+    if not filename or Path(filename).name != filename:
+        raise ValueError("source.filename_pattern must render one filename")
+    return configured / filename
+
+
 def move_source_file(
     source: dict[str, Any], config_dir: Path, destination_directory: str
 ) -> Path:
     """Move a file source without overwriting an existing destination file."""
 
-    source_path = configured_path(source["path"], config_dir)
+    source_path = resolved_source_path(source, config_dir)
     destination = configured_path(destination_directory, config_dir)
     if not source_path.is_file():
         raise FileNotFoundError(f"Source file is not available to move: {source_path}")
@@ -191,7 +239,7 @@ def iter_source_chunks(
             engine.dispose()
         return
 
-    path = configured_path(source["path"], config_dir)
+    path = resolved_source_path(source, config_dir)
     if not path.is_file():
         raise FileNotFoundError(f"Source file does not exist: {path}")
     if source_type in {"csv", "tsv"}:
@@ -420,6 +468,13 @@ def validate_loader(loader: dict[str, Any], destination: dict[str, Any]) -> None
             raise ValueError(f"Loader {loader['name']} has unsupported source type {source_type}")
         if not source.get("path"):
             raise ValueError(f"File loader {loader['name']} needs a source path")
+        pattern = source.get("filename_pattern")
+        if pattern is not None:
+            if not isinstance(pattern, str) or not pattern:
+                raise ValueError(
+                    f"Loader {loader['name']} source.filename_pattern must be text"
+                )
+            resolved_source_path(source, Path("."))
         file_move = source.get("file_move", {})
         if not isinstance(file_move, dict):
             raise ValueError(f"Loader {loader['name']} source.file_move must be a mapping")
@@ -464,6 +519,41 @@ def validate_loader(loader: dict[str, Any], destination: dict[str, Any]) -> None
         raise ValueError(f"Loader {loader['name']} needs staging_to_prod.sql")
 
 
+def validate_health(health: dict[str, Any], loader_name: str) -> None:
+    """Validate values constrained by ETL.RunHistory before opening a connection."""
+
+    if not health.get("enabled", False):
+        return
+    schema = health.get("schema", "ETL")
+    if not isinstance(schema, str) or not IDENTIFIER.fullmatch(schema):
+        raise ValueError(f"Loader {loader_name} has an invalid health schema")
+    source_type = health.get("source_type")
+    if source_type is not None and source_type not in HEALTH_SOURCE_TYPES:
+        raise ValueError(
+            f"Loader {loader_name} health.source_type must be one of "
+            f"{', '.join(sorted(HEALTH_SOURCE_TYPES))}"
+        )
+    load_type = health.get("load_type")
+    if load_type is not None and load_type not in HEALTH_LOAD_TYPES:
+        raise ValueError(
+            f"Loader {loader_name} health.load_type must be one of "
+            f"{', '.join(sorted(HEALTH_LOAD_TYPES))}"
+        )
+    for key in ("target_schema", "target_table"):
+        value = health.get(key)
+        if value is not None and (
+            not isinstance(value, str) or not IDENTIFIER.fullmatch(value)
+        ):
+            raise ValueError(f"Loader {loader_name} health.{key} is invalid")
+    parent_run_id = health.get("parent_etl_run_id")
+    if parent_run_id is not None and (
+        not isinstance(parent_run_id, int) or parent_run_id <= 0
+    ):
+        raise ValueError(
+            f"Loader {loader_name} health.parent_etl_run_id must be a positive integer"
+        )
+
+
 def load_configuration(path: Path) -> tuple[dict[str, Any], list[tuple[dict[str, Any], dict[str, Any]]]]:
     with path.open("r", encoding="utf-8") as stream:
         config = expand_environment(yaml.safe_load(stream))
@@ -482,6 +572,7 @@ def load_configuration(path: Path) -> tuple[dict[str, Any], list[tuple[dict[str,
             default_destination, loader.get("destination", {})
         )
         validate_loader(loader, destination)
+        validate_health(deep_merge(config.get("health", {}), loader.get("health", {})), loader["name"])
         jobs.append((loader, destination))
     return config, jobs
 
@@ -492,6 +583,7 @@ def run_loader(
     default_health: dict[str, Any],
     config_dir: Path,
     run_id: str,
+    log_path: Path,
 ) -> dict[str, Any]:
     started = datetime.now(US_EASTERN)
     target = f"{destination.get('staging_schema', 'stg')}.{destination['staging_table']}"
@@ -500,6 +592,7 @@ def run_loader(
         "target": target,
         "status": "FAILED",
         "rows": 0,
+        "batches": 0,
         "started_at": started.isoformat(),
         "warnings": [],
         "error": None,
@@ -509,17 +602,26 @@ def run_loader(
     source_chunks: Iterator[pd.DataFrame] | None = None
     failure_phase = "destination"
     health = deep_merge(default_health, loader.get("health", {}))
+    health_run_id: int | None = None
+    runtime_loader = copy.deepcopy(loader)
     try:
+        if loader["source"].get("type", "csv").lower() != "sql":
+            runtime_loader["source"]["path"] = str(
+                resolved_source_path(loader["source"], config_dir)
+            )
+            runtime_loader["source"].pop("filename_pattern", None)
         engine = build_engine(destination["connection"], fast=True)
         try:
-            record_start(engine, health, run_id, loader["name"], target, started)
+            health_run_id = record_start(
+                engine, health, runtime_loader, destination, config_dir
+            )
         except Exception as exc:
             if health.get("required", False):
                 raise
             result["warnings"].append(f"Health start failed: {str(exc)[:500]}")
 
         batch_size = int(destination.get("batch_size", 1000))
-        source_chunks = iter_source_chunks(loader["source"], config_dir, batch_size)
+        source_chunks = iter_source_chunks(runtime_loader["source"], config_dir, batch_size)
         first_frame: pd.DataFrame | None = None
         failure_phase = "source"
         for raw_frame in source_chunks:
@@ -578,6 +680,7 @@ def run_loader(
             write_chunk(first_frame, first_write_mode)
             result["rows"] += len(first_frame)
             chunk_number = 1
+            result["batches"] = chunk_number
 
         failure_phase = "source"
         for raw_frame in source_chunks:
@@ -589,6 +692,7 @@ def run_loader(
             write_chunk(frame, "append")
             result["rows"] += len(frame)
             chunk_number += 1
+            result["batches"] = chunk_number
             if chunk_number % 10 == 0:
                 LOGGER.info(
                     "Loader %s committed %s staging rows",
@@ -621,7 +725,7 @@ def run_loader(
             except Exception as exc:
                 result["warnings"].append(f"Source cleanup failed: {str(exc)[:500]}")
 
-        source = loader["source"]
+        source = runtime_loader["source"]
         file_move = source.get("file_move", {})
         move_directory = None
         move_label = None
@@ -632,6 +736,7 @@ def run_loader(
             move_directory = file_move.get("error_directory")
             move_label = "error"
         if move_directory:
+            failure_phase = "file_move"
             try:
                 moved_path = move_source_file(source, config_dir, move_directory)
                 result["file_action"] = f"Moved to {moved_path}"
@@ -649,15 +754,33 @@ def run_loader(
         result["finished_at"] = finished.isoformat()
         if engine is not None:
             try:
+                successful = result["status"] == "SUCCESS"
+                failure_status = {
+                    "source": "FAILED_EXTRACTION",
+                    "destination": "FAILED_DATABASE_LOAD",
+                    "promotion": "FAILED_DATABASE_LOAD",
+                    "file_move": "FAILED",
+                }.get(failure_phase, "FAILED")
                 record_finish(
                     engine,
                     health,
-                    run_id,
-                    loader["name"],
-                    result["status"],
-                    finished,
-                    result["rows"],
-                    result["error"],
+                    health_run_id,
+                    {
+                        "rows_received": result["rows"],
+                        "rows_extracted": result["rows"],
+                        "rows_staged": result["rows"],
+                        "rows_valid": result["rows"],
+                        "rows_inserted": result["rows"] if successful else 0,
+                        "batch_count": result["batches"],
+                        "file_count": int(
+                            runtime_loader["source"].get("type", "csv").lower() != "sql"
+                        ),
+                        "log_file_path": str(log_path),
+                        "run_status": "COMPLETED" if successful else failure_status,
+                        "error_code": None if successful else failure_phase.upper(),
+                        "error_message": result["error"],
+                        "validate_reconciliation": successful,
+                    },
                 )
             except Exception as exc:
                 result["warnings"].append(f"Health finish failed: {str(exc)[:500]}")
@@ -671,7 +794,7 @@ def run_loader(
     return result
 
 
-def run(config_path: Path) -> tuple[dict[str, Any], bool]:
+def run(config_path: Path, log_path: Path) -> tuple[dict[str, Any], bool]:
     config, jobs = load_configuration(config_path)
     run_id = str(uuid.uuid4())
     started = datetime.now(US_EASTERN)
@@ -700,6 +823,7 @@ def run(config_path: Path) -> tuple[dict[str, Any], bool]:
                 config.get("health", {}),
                 config_path.parent,
                 run_id,
+                log_path,
             )
         )
 
@@ -726,26 +850,29 @@ def main() -> int:
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
-    handler = logging.StreamHandler()
-    handler.setFormatter(EasternFormatter("%(asctime)s %(levelname)s %(message)s"))
-    logging.basicConfig(level=getattr(logging, args.log_level), handlers=[handler])
     try:
+        log_path = configure_logging(args.log_level)
+        LOGGER.info("Loader started; log file: %s", log_path)
         config_path = args.config.expanduser().resolve()
         config, jobs = load_configuration(config_path)
         if args.validate_only:
+            LOGGER.info("Configuration is valid; %d loader(s) found", len(jobs))
             print(f"Configuration is valid. {len(jobs)} loader(s) found.")
             return 0
-        summary, email_failed = run(config_path)
+        summary, email_failed = run(config_path, log_path)
     except Exception as exc:
+        LOGGER.exception("Configuration/startup error: %s", exc)
         print(f"Configuration/startup error: {exc}", file=sys.stderr)
         return 3
 
-    print(
+    completion_message = (
         f"Run {summary['run_id']} finished with {summary['status']}: "
         f"{sum(item['status'] == 'SUCCESS' for item in summary['results'])} succeeded, "
         f"{sum(item['status'] == 'FAILED' for item in summary['results'])} failed, "
         f"{sum(item['status'] == 'SKIPPED' for item in summary['results'])} skipped."
     )
+    LOGGER.info(completion_message)
+    print(completion_message)
     if summary["status"] == "FAILED":
         return 1
     if email_failed and config.get("email", {}).get("required", False):
