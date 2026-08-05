@@ -46,6 +46,8 @@ loaders:
 
 The same effective connection is passed to `etl_health.py`, so health records automatically follow a loader-level server or database override. There is no separate health connection.
 
+Console logs, run summaries, health records, and email timestamps use U.S. Eastern time (`America/New_York`) and automatically follow daylight-saving time.
+
 Supported sources are `csv` (including delimited `.txt` files), `tsv`, `excel`, `json`, `parquet`, and `sql` query. CSV/TSV and SQL sources are streamed in `batch_size` chunks. Every loader supplies its column mapping and SQL type:
 
 ```yaml

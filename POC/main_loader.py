@@ -10,11 +10,12 @@ import re
 import shutil
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from collections.abc import Iterator
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import yaml
@@ -34,6 +35,15 @@ TYPE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 FILE_SOURCE_TYPES = {"csv", "tsv", "excel", "json", "parquet"}
+US_EASTERN = ZoneInfo("America/New_York")
+
+
+class EasternFormatter(logging.Formatter):
+    """Format log timestamps in U.S. Eastern time."""
+
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
+        value = datetime.fromtimestamp(record.created, US_EASTERN)
+        return value.strftime(datefmt) if datefmt else value.isoformat(timespec="milliseconds")
 
 
 def expand_environment(value: Any) -> Any:
@@ -483,7 +493,7 @@ def run_loader(
     config_dir: Path,
     run_id: str,
 ) -> dict[str, Any]:
-    started = datetime.now(timezone.utc)
+    started = datetime.now(US_EASTERN)
     target = f"{destination.get('staging_schema', 'stg')}.{destination['staging_table']}"
     result = {
         "loader": loader["name"],
@@ -635,7 +645,7 @@ def run_loader(
                     result["warnings"].append(message)
                 LOGGER.error("Loader %s %s", loader["name"], message)
 
-        finished = datetime.now(timezone.utc)
+        finished = datetime.now(US_EASTERN)
         result["finished_at"] = finished.isoformat()
         if engine is not None:
             try:
@@ -664,11 +674,11 @@ def run_loader(
 def run(config_path: Path) -> tuple[dict[str, Any], bool]:
     config, jobs = load_configuration(config_path)
     run_id = str(uuid.uuid4())
-    started = datetime.now(timezone.utc)
+    started = datetime.now(US_EASTERN)
     results = []
     for loader, destination in jobs:
         if not loader.get("enabled", True):
-            now = datetime.now(timezone.utc).isoformat()
+            now = datetime.now(US_EASTERN).isoformat()
             results.append(
                 {
                     "loader": loader["name"],
@@ -698,7 +708,7 @@ def run(config_path: Path) -> tuple[dict[str, Any], bool]:
         "run_id": run_id,
         "status": "FAILED" if failed else "SUCCESS",
         "started_at": started.isoformat(),
-        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "finished_at": datetime.now(US_EASTERN).isoformat(),
         "results": results,
     }
     email_failed = False
@@ -716,10 +726,9 @@ def main() -> int:
     parser.add_argument("--validate-only", action="store_true")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     args = parser.parse_args()
-    logging.basicConfig(
-        level=getattr(logging, args.log_level),
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+    handler = logging.StreamHandler()
+    handler.setFormatter(EasternFormatter("%(asctime)s %(levelname)s %(message)s"))
+    logging.basicConfig(level=getattr(logging, args.log_level), handlers=[handler])
     try:
         config_path = args.config.expanduser().resolve()
         config, jobs = load_configuration(config_path)
