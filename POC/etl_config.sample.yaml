@@ -45,6 +45,9 @@ loaders:
     source:
       type: csv
       path: '\\your-file-server\share\inbound\sample.txt'
+      file_move:
+        success_directory: '\\your-file-server\share\archive'
+        error_directory: '\\your-file-server\share\errors'
       options:
         sep: '|'
         encoding: utf-8-sig

@@ -7,6 +7,7 @@ import copy
 import logging
 import os
 import re
+import shutil
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -32,6 +33,7 @@ TYPE_PATTERN = re.compile(
     r"^(?P<name>[a-z][a-z0-9]*)(?:\((?P<first>max|\d+)(?:,(?P<second>\d+))?\))?$",
     re.IGNORECASE,
 )
+FILE_SOURCE_TYPES = {"csv", "tsv", "excel", "json", "parquet"}
 
 
 def expand_environment(value: Any) -> Any:
@@ -130,6 +132,33 @@ def build_engine(connection: dict[str, Any], *, fast: bool = False) -> Engine:
     return create_engine(url, **options)
 
 
+def configured_path(value: str, config_dir: Path) -> Path:
+    """Resolve a YAML path relative to the configuration file."""
+
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else config_dir / path
+
+
+def move_source_file(
+    source: dict[str, Any], config_dir: Path, destination_directory: str
+) -> Path:
+    """Move a file source without overwriting an existing destination file."""
+
+    source_path = configured_path(source["path"], config_dir)
+    destination = configured_path(destination_directory, config_dir)
+    if not source_path.is_file():
+        raise FileNotFoundError(f"Source file is not available to move: {source_path}")
+    if not destination.is_dir():
+        raise FileNotFoundError(f"Move destination does not exist: {destination}")
+    if os.path.normcase(str(source_path.parent)) == os.path.normcase(str(destination)):
+        raise ValueError("Move destination must differ from the source directory")
+
+    target = destination / source_path.name
+    if target.exists():
+        raise FileExistsError(f"Move target already exists: {target}")
+    return Path(shutil.move(str(source_path), str(target)))
+
+
 def iter_source_chunks(
     source: dict[str, Any], config_dir: Path, batch_size: int
 ) -> Iterator[pd.DataFrame]:
@@ -152,9 +181,7 @@ def iter_source_chunks(
             engine.dispose()
         return
 
-    path = Path(source["path"]).expanduser()
-    if not path.is_absolute():
-        path = config_dir / path
+    path = configured_path(source["path"], config_dir)
     if not path.is_file():
         raise FileNotFoundError(f"Source file does not exist: {path}")
     if source_type in {"csv", "tsv"}:
@@ -376,8 +403,21 @@ def validate_loader(loader: dict[str, Any], destination: dict[str, Any]) -> None
     if source_type == "sql":
         if not source.get("connection") or not source.get("query"):
             raise ValueError(f"SQL loader {loader['name']} needs connection and query")
-    elif not source.get("path"):
-        raise ValueError(f"File loader {loader['name']} needs a source path")
+        if source.get("file_move"):
+            raise ValueError(f"SQL loader {loader['name']} cannot use source.file_move")
+    else:
+        if source_type not in FILE_SOURCE_TYPES:
+            raise ValueError(f"Loader {loader['name']} has unsupported source type {source_type}")
+        if not source.get("path"):
+            raise ValueError(f"File loader {loader['name']} needs a source path")
+        file_move = source.get("file_move", {})
+        if not isinstance(file_move, dict):
+            raise ValueError(f"Loader {loader['name']} source.file_move must be a mapping")
+        for key in ("success_directory", "error_directory"):
+            if key in file_move and not isinstance(file_move[key], str):
+                raise ValueError(
+                    f"Loader {loader['name']} source.file_move.{key} must be a path"
+                )
 
     target_names: set[str] = set()
     for column in loader["columns"]:
@@ -453,9 +493,11 @@ def run_loader(
         "started_at": started.isoformat(),
         "warnings": [],
         "error": None,
+        "file_action": None,
     }
     engine: Engine | None = None
     source_chunks: Iterator[pd.DataFrame] | None = None
+    failure_phase = "destination"
     health = deep_merge(default_health, loader.get("health", {}))
     try:
         engine = build_engine(destination["connection"], fast=True)
@@ -469,6 +511,7 @@ def run_loader(
         batch_size = int(destination.get("batch_size", 1000))
         source_chunks = iter_source_chunks(loader["source"], config_dir, batch_size)
         first_frame: pd.DataFrame | None = None
+        failure_phase = "source"
         for raw_frame in source_chunks:
             converted = convert_columns(raw_frame, loader["columns"])
             if not converted.empty:
@@ -490,6 +533,7 @@ def run_loader(
             for target_column, column in zip(target_columns, loader["columns"])
         }
 
+        failure_phase = "destination"
         if staging_mode == "truncate_append":
             with engine.begin() as connection:
                 if not inspect(connection).has_table(
@@ -519,15 +563,19 @@ def run_loader(
 
         chunk_number = 0
         if first_frame is not None:
+            failure_phase = "destination"
             first_write_mode = "append" if staging_mode == "truncate_append" else staging_mode
             write_chunk(first_frame, first_write_mode)
             result["rows"] += len(first_frame)
             chunk_number = 1
 
+        failure_phase = "source"
         for raw_frame in source_chunks:
+            failure_phase = "source"
             frame = convert_columns(raw_frame, loader["columns"])
             if frame.empty:
                 continue
+            failure_phase = "destination"
             write_chunk(frame, "append")
             result["rows"] += len(frame)
             chunk_number += 1
@@ -537,10 +585,13 @@ def run_loader(
                     loader["name"],
                     f"{result['rows']:,}",
                 )
+            failure_phase = "source"
 
         if first_frame is None and staging_mode in {"replace", "fail"}:
+            failure_phase = "destination"
             write_chunk(pd.DataFrame(columns=target_columns), staging_mode)
 
+        failure_phase = "promotion"
         with engine.begin() as connection:
             staging_to_production(
                 connection,
@@ -554,13 +605,38 @@ def run_loader(
         result["error"] = str(exc).replace("\r", " ").replace("\n", " ")[:2000]
         LOGGER.error("Loader %s failed: %s", loader["name"], result["error"])
     finally:
-        finished = datetime.now(timezone.utc)
-        result["finished_at"] = finished.isoformat()
         if source_chunks is not None:
             try:
                 source_chunks.close()
             except Exception as exc:
                 result["warnings"].append(f"Source cleanup failed: {str(exc)[:500]}")
+
+        source = loader["source"]
+        file_move = source.get("file_move", {})
+        move_directory = None
+        move_label = None
+        if result["status"] == "SUCCESS":
+            move_directory = file_move.get("success_directory")
+            move_label = "archive"
+        elif failure_phase == "source":
+            move_directory = file_move.get("error_directory")
+            move_label = "error"
+        if move_directory:
+            try:
+                moved_path = move_source_file(source, config_dir, move_directory)
+                result["file_action"] = f"Moved to {moved_path}"
+                LOGGER.info("Loader %s moved source to %s", loader["name"], moved_path)
+            except Exception as exc:
+                message = f"Source {move_label} move failed: {str(exc)[:1000]}"
+                if result["status"] == "SUCCESS":
+                    result["status"] = "FAILED"
+                    result["error"] = message
+                else:
+                    result["warnings"].append(message)
+                LOGGER.error("Loader %s %s", loader["name"], message)
+
+        finished = datetime.now(timezone.utc)
+        result["finished_at"] = finished.isoformat()
         if engine is not None:
             try:
                 record_finish(

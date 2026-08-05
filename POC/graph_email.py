@@ -15,7 +15,11 @@ def _summary_html(summary: dict[str, Any]) -> str:
     for result in summary["results"]:
         details = "; ".join(
             value
-            for value in [result.get("error"), *result.get("warnings", [])]
+            for value in [
+                result.get("file_action"),
+                result.get("error"),
+                *result.get("warnings", []),
+            ]
             if value
         )
         rows.append(

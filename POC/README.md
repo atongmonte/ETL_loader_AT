@@ -56,6 +56,19 @@ columns:
 
 Supported common types are integer types, `decimal(p,s)`, `float`, `bit`, character types, `date`, `datetime`, `datetime2`, and `uniqueidentifier`.
 
+For file sources, optional post-load handling moves a fully successful file to an archive folder. A source file that fails during file access, parsing, or column conversion moves to an error folder. Destination database and production-promotion failures leave the inbound file in place for retry:
+
+```yaml
+source:
+  type: csv
+  path: '\\your-file-server\share\inbound\sample.txt'
+  file_move:
+    success_directory: '\\your-file-server\share\archive'
+    error_directory: '\\your-file-server\share\errors'
+```
+
+The destination folders must already exist. Existing files are never overwritten; a filename collision causes the move to fail and is included in the loader result.
+
 ## Staging to production
 
 The `staging_to_prod.mode` values are:
