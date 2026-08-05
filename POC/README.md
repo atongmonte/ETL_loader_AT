@@ -17,9 +17,9 @@ py -3.12 .\main_loader.py --config .\etl_config.yaml --validate-only
 py -3.12 .\main_loader.py --config .\etl_config.yaml
 ```
 
-`etl_config.sample.yaml` contains placeholders only. Copy it to the Git-ignored `etl_config.yaml`, then put real server, database, source-file, and destination settings only in that local file or in environment variables.
+`etl_config.sample.yaml` contains placeholders only. Copy it to the Git-ignored `etl_config.yaml`, then put real server, database, source-file, destination, sender, and recipient settings in that local YAML file.
 
-`.env.sample` is the only environment template tracked by Git. Real `.env`, `.env.local`, and `.env.example` files are ignored. The loader does not automatically read those files; inject the values into the process through PowerShell, your scheduler, or an approved secret manager.
+`.env.sample` is the only environment template tracked by Git and contains only the three Microsoft Graph authentication values: tenant ID, client ID, and client secret. Real `.env`, `.env.local`, and `.env.example` files are ignored. The loader does not automatically read those files; inject the values into the process through PowerShell, your scheduler, or an approved secret manager. Store all non-sensitive settings in YAML.
 
 The `truncate_append` mode requires the staging table to exist, truncates it once, and then appends each chunk while preserving the table definition and database defaults.
 
@@ -97,7 +97,7 @@ health:
 
 ## Graph summary email
 
-Create a Microsoft Entra application with Microsoft Graph application permission `Mail.Send` and tenant admin consent. Put credentials in environment variables, then enable the YAML email section:
+Create a Microsoft Entra application with Microsoft Graph application permission `Mail.Send` and tenant admin consent. Put only its tenant ID, client ID, and client secret in environment variables. Store sender and recipients in YAML, then enable the email section:
 
 ```yaml
 email:
@@ -105,9 +105,9 @@ email:
   tenant_id: "${GRAPH_TENANT_ID}"
   client_id: "${GRAPH_CLIENT_ID}"
   client_secret: "${GRAPH_CLIENT_SECRET}"
-  sender: "${GRAPH_SENDER}"
+  sender: etl-service@example.org
   recipients:
-    - "${GRAPH_RECIPIENT}"
+    - data-operations@example.org
 ```
 
 The script uses the client-credentials flow and calls `POST /v1.0/users/{sender}/sendMail`. Keep secrets out of YAML and source control. See Microsoft's [sendMail API](https://learn.microsoft.com/en-us/graph/api/user-sendmail?view=graph-rest-1.0) and [client-credentials flow](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow) documentation.

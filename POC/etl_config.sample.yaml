@@ -1,19 +1,15 @@
-# Safe sample configuration. Do not put real server names, file shares,
-# credentials, email addresses, or production table names in this file.
+# Safe sample configuration. Replace placeholders only in the Git-ignored
+# etl_config.yaml file. Keep Graph credentials outside YAML.
 version: 1
 
 default_destination:
   connection:
     dialect: mssql+pyodbc
     driver: ODBC Driver 17 for SQL Server
-    server: "${DEST_SQL_SERVER:-YOUR_SQL_SERVER}"
-    database: "${DEST_SQL_DATABASE:-YOUR_DATABASE}"
+    server: YOUR_SQL_SERVER
+    database: YOUR_DATABASE
     auth:
       mode: trusted
-      # SQL authentication example:
-      # mode: sql_password
-      # username: "${DEST_SQL_USERNAME}"
-      # password: "${DEST_SQL_PASSWORD}"
     encrypt: true
     trust_server_certificate: false
   staging_schema: STG
@@ -35,8 +31,9 @@ email:
   tenant_id: "${GRAPH_TENANT_ID:-}"
   client_id: "${GRAPH_CLIENT_ID:-}"
   client_secret: "${GRAPH_CLIENT_SECRET:-}"
-  sender: "${GRAPH_SENDER:-}"
-  recipients: []
+  sender: etl-service@example.org
+  recipients:
+    - data-operations@example.org
   cc: []
   subject_prefix: Sample ETL summary
   timeout_seconds: 30
@@ -47,7 +44,7 @@ loaders:
     enabled: true
     source:
       type: csv
-      path: '${SOURCE_FILE_PATH:-\\your-file-server\share\inbound\sample.txt}'
+      path: '\\your-file-server\share\inbound\sample.txt'
       options:
         sep: '|'
         encoding: utf-8-sig
