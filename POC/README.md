@@ -1,0 +1,112 @@
+# Simple YAML ETL Loader
+
+This version has three Python files:
+
+- `main_loader.py` reads every YAML loader, loads source data into staging, and optionally moves staging to production.
+- `etl_health.py` writes `RUNNING`, `SUCCESS`, and `FAILED` information to an ETL health table.
+- `graph_email.py` sends one summary email through Microsoft Graph after all loaders finish.
+
+## Install and run
+
+From this directory:
+
+```powershell
+py -3.12 -m pip install -r .\requirements.txt
+py -3.12 .\main_loader.py --config .\etl_config.yaml --validate-only
+py -3.12 .\main_loader.py --config .\etl_config.yaml
+```
+
+The active configuration streams the pipe-delimited `CCX_Extract_MHS_07302026.txt` file from the Procurement UNC share into `[MISCDEVDB].[PRIME_DEV].[GHX].[_STG_ContractLineDetails]`. The extract is read and committed in 10,000-row chunks so the approximately 3.1 GB file is not held in memory.
+
+Before the first load, run `Create_GHX_STG_ContractLineDetails.sql` against `MISCDEVDB / PRIME_DEV`. The configured `truncate_append` mode requires the table to exist, truncates it once, and then appends each chunk while preserving the table definition and `LastUpdate` default.
+
+## YAML behavior
+
+`default_destination` is the shared SQL Server destination. Each loader inherits it and may override values:
+
+```yaml
+default_destination:
+  connection:
+    server: MainSqlServer
+    database: Warehouse
+    auth: {mode: trusted}
+  staging_schema: GHX
+  staging_load_mode: truncate_append
+
+loaders:
+  - name: orders
+    destination:
+      connection:
+        database: OtherWarehouse  # Keeps the default server/auth.
+      staging_table: orders_stg
+```
+
+The same effective connection is passed to `etl_health.py`, so health records automatically follow a loader-level server or database override. There is no separate health connection.
+
+Supported sources are `csv` (including delimited `.txt` files), `tsv`, `excel`, `json`, `parquet`, and `sql` query. CSV/TSV and SQL sources are streamed in `batch_size` chunks. Every loader supplies its column mapping and SQL type:
+
+```yaml
+columns:
+  - {source: ExternalId, target: customer_id, type: bigint, nullable: false}
+  - {source: Name, target: customer_name, type: "nvarchar(150)"}
+```
+
+Supported common types are integer types, `decimal(p,s)`, `float`, `bit`, character types, `date`, `datetime`, `datetime2`, and `uniqueidentifier`.
+
+## Staging to production
+
+The `staging_to_prod.mode` values are:
+
+- `none`: stop after staging.
+- `append`: insert all staging rows into an existing production table.
+- `truncate_insert`: truncate the production table, then insert all staging rows.
+- `stored_procedure`: execute a configured `schema.procedure` after staging.
+- `sql`: execute trusted SQL from the YAML file.
+
+For generic insert modes, the production table must already exist and have the configured target columns. Use `staging_load_mode: replace` or `truncate_append` so only the current source rows are promoted.
+
+Stored-procedure example:
+
+```yaml
+staging_to_prod:
+  mode: stored_procedure
+  procedure: dbo.usp_customers_staging_to_prod
+  parameters:
+    run_id: $RUN_ID
+```
+
+Each staging chunk commits independently to avoid one extremely large SQL Server transaction. Production promotion runs only after every staging chunk succeeds. If a later staging chunk fails, production is not changed and the loader is reported as failed.
+
+## ETL health table
+
+Health logging is off in the sample. Enable it with:
+
+```yaml
+health:
+  enabled: true
+  schema: dbo
+  table: etl_health
+  auto_create: true
+  required: false
+```
+
+`auto_create: true` creates the simple table used by `etl_health.py`; the schema itself must already exist. Set `required: true` if a health-write failure should fail the loader.
+
+## Graph summary email
+
+Create a Microsoft Entra application with Microsoft Graph application permission `Mail.Send` and tenant admin consent. Put credentials in environment variables, then enable the YAML email section:
+
+```yaml
+email:
+  enabled: true
+  tenant_id: "${GRAPH_TENANT_ID}"
+  client_id: "${GRAPH_CLIENT_ID}"
+  client_secret: "${GRAPH_CLIENT_SECRET}"
+  sender: "${GRAPH_SENDER}"
+  recipients:
+    - "${GRAPH_RECIPIENT}"
+```
+
+The script uses the client-credentials flow and calls `POST /v1.0/users/{sender}/sendMail`. Keep secrets out of YAML and source control. See Microsoft's [sendMail API](https://learn.microsoft.com/en-us/graph/api/user-sendmail?view=graph-rest-1.0) and [client-credentials flow](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow) documentation.
+
+Exit codes are `0` for success, `1` for a loader failure, `2` for a required email failure, and `3` for invalid configuration/startup.

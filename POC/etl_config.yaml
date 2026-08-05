@@ -1,0 +1,112 @@
+version: 1
+
+default_destination:
+  connection:
+    dialect: mssql+pyodbc
+    driver: ODBC Driver 17 for SQL Server
+    server: MISCDEVDB
+    database: PRIME_DEV
+    auth:
+      mode: trusted
+    encrypt: true
+    trust_server_certificate: true
+  staging_schema: GHX
+  staging_load_mode: truncate_append
+  batch_size: 10000
+  allow_empty: false
+
+# Health uses the same MISCDEVDB / PRIME_DEV connection resolved above.
+health:
+  enabled: false
+  schema: dbo
+  table: etl_health
+  auto_create: false
+  required: false
+
+email:
+  enabled: false
+  required: false
+  tenant_id: "${GRAPH_TENANT_ID:-}"
+  client_id: "${GRAPH_CLIENT_ID:-}"
+  client_secret: "${GRAPH_CLIENT_SECRET:-}"
+  sender: "${GRAPH_SENDER:-}"
+  recipients: []
+  cc: []
+  subject_prefix: ContractLineDetails ETL summary
+  timeout_seconds: 30
+  save_to_sent_items: false
+
+loaders:
+  - name: ContractLineCCX
+    enabled: true
+    source:
+      type: csv
+      # The folder contains CCX_Extract_MHS_07302026.txt. The originally
+      # requested CCX_Extract_07302026.txt filename is not present.
+      path: '\\montefiore.org\centralfiles\data\Procurement PMO\_Data\CCX\INBOUND\CCX_Extract_MHS_07302026.txt'
+      options:
+        sep: '|'
+        encoding: utf-8-sig
+        dtype: string
+        keep_default_na: false
+        on_bad_lines: error
+
+    destination:
+      staging_table: _STG_ContractLineDetails
+
+    columns:
+      - {source: Organization_Name, target: Organization, type: "varchar(500)", nullable: false}
+      - {source: Contract_Number, target: ContractID, type: "varchar(500)", nullable: false}
+      - {source: Contract_Description, target: ContractDescription, type: "varchar(500)", nullable: false}
+      - {source: Tier_Level, target: TierLevel, type: "varchar(500)", nullable: false}
+      - {source: Tier_Description, target: TierDescription, type: "varchar(500)", nullable: false}
+      - {source: Manufacturer_Name, target: ManufacturerName, type: "varchar(500)", nullable: false}
+      - {source: Manufacturer_Part_Number, target: ManufacturerPartNumber, type: "varchar(500)", nullable: false}
+      - {source: Part_Description, target: PartDescription, type: "varchar(500)", nullable: false}
+      - {source: Vendor_Name, target: VendorName, type: "varchar(500)", nullable: false}
+      - {source: Vendor_Part_Number, target: VendorPartNumber, type: "varchar(500)", nullable: false}
+      - {source: Buyer_Part_Number, target: BuyerPartNumber, type: "varchar(500)", nullable: true}
+      - {source: Source, target: Source, type: "varchar(500)", nullable: false}
+      - {source: Contract_Tier_Start_Date, target: ContractTierStartDate, type: "varchar(500)", nullable: false}
+      - {source: Contract_Tier_End_Date, target: ContractTierEndDate, type: "varchar(500)", nullable: false}
+      - {source: UOM, target: UOM, type: "varchar(500)", nullable: false}
+      - {source: QOE, target: QOE, type: "varchar(500)", nullable: false}
+      - {source: Price, target: Price, type: "varchar(500)", nullable: false}
+      - {source: Adjustment_Percent, target: AdjustmentPercent, type: "varchar(500)", nullable: false}
+      - {source: Adjusted_Price, target: AdjustedPrice, type: "varchar(500)", nullable: false}
+      - {source: Item_Price_Start_Date, target: ItemPriceStartDate, type: "varchar(500)", nullable: false}
+      - {source: Item_Price_End_Date, target: ItemPriceEndDate, type: "varchar(500)", nullable: false}
+      - {source: Is_My_Item, target: IsMyItem, type: "varchar(500)", nullable: true}
+      - {source: Contract_Owner, target: ContractOwner, type: "varchar(500)", nullable: true}
+      - {source: Contract_Type, target: ContractType, type: "varchar(500)", nullable: false}
+      - {source: Replacement_for_Contract_Number, target: ReplacementForContractNumber, type: "varchar(500)", nullable: true}
+      - {source: Product_Description_or_Category, target: ProductDescriptionOrCategory, type: "varchar(500)", nullable: true}
+      - {source: Administrative_Fee, target: AdministrativeFee, type: "varchar(500)", nullable: true}
+      - {source: Notes, target: Notes, type: "varchar(500)", nullable: true}
+      - {source: Contract_Review_Date, target: ContractReviewDate, type: "varchar(500)", nullable: true}
+      - {source: Contract_State, target: ContractState, type: "varchar(500)", nullable: true}
+      - {source: Price_Protected_Date, target: PriceProtectedDate, type: "varchar(500)", nullable: true}
+      - {source: Product_UNSPSC, target: ProductUNSPSC, type: "varchar(500)", nullable: true}
+      - {source: GPO_Contract_Reference, target: GPOContractReference, type: "varchar(500)", nullable: true}
+      - {source: Lease_Payment_Terms, target: LeasePaymentTerms, type: "varchar(500)", nullable: true}
+      - {source: Rebate_Frequency, target: RebateFrequency, type: "varchar(500)", nullable: true}
+      - {source: Rebate_Dollar_Amount, target: RebateAmount, type: "varchar(500)", nullable: true}
+      - {source: Date_Rebate_Expected, target: DateRebateExpected, type: "varchar(500)", nullable: true}
+      - {source: Method_of_Payment, target: MethodOfPayment, type: "varchar(500)", nullable: true}
+      - {source: Other_Contract_Details, target: OtherContractDetails, type: "varchar(500)", nullable: true}
+      - {source: Rebate_Basis, target: RebateBasis, type: "varchar(500)", nullable: true}
+      - {source: Requires_Commitment_to, target: RequiresCommitmentTo, type: "varchar(500)", nullable: true}
+      - {source: Commitment_Measure, target: CommitmentMeasure, type: "varchar(500)", nullable: true}
+      - {source: Other_Known_Competitors, target: OtherKnownCompetitors, type: "varchar(500)", nullable: true}
+      - {source: OrganizationEID, target: OrganizationEID, type: "varchar(500)", nullable: false}
+      - {source: ContractOrgID, target: ContractOrgID, type: "varchar(500)", nullable: false}
+      - {source: VendorERPNumber, target: ERPVendorID, type: "varchar(500)", nullable: true}
+      - {source: IsSUOM, target: IsSUOM, type: "varchar(500)", nullable: false}
+      - {source: SourceContractType, target: SourceContractType, type: "varchar(500)", nullable: false}
+      - {source: ManufacturerEID, target: ManufacturerEID, type: "varchar(500)", nullable: true}
+      - {source: VendorEID, target: VendorEID, type: "varchar(500)", nullable: true}
+
+    # Load the raw file into GHX._STG_ContractLineDetails only. Enable a
+    # validated stored procedure or SQL promotion after STG data is approved.
+    staging_to_prod:
+      mode: none
