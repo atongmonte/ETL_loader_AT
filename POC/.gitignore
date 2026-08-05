@@ -4,7 +4,7 @@ __pycache__/
 venv/
 .env
 .env.*
-!.env.example
+!.env.sample
 etl_config.yaml
 etl_config.local.yaml
 *.log

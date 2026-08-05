@@ -19,6 +19,8 @@ py -3.12 .\main_loader.py --config .\etl_config.yaml
 
 `etl_config.sample.yaml` contains placeholders only. Copy it to the Git-ignored `etl_config.yaml`, then put real server, database, source-file, and destination settings only in that local file or in environment variables.
 
+`.env.sample` is the only environment template tracked by Git. Real `.env`, `.env.local`, and `.env.example` files are ignored. The loader does not automatically read those files; inject the values into the process through PowerShell, your scheduler, or an approved secret manager.
+
 The `truncate_append` mode requires the staging table to exist, truncates it once, and then appends each chunk while preserving the table definition and database defaults.
 
 ## YAML behavior
