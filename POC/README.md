@@ -2,8 +2,8 @@
 
 This version has three Python files:
 
-- `main_loader.py` reads every YAML loader, loads source data into staging, and optionally moves staging to production.
-- `etl_health.py` writes `RUNNING`, `SUCCESS`, and `FAILED` information to an ETL health table.
+- `main_loader.py` reads every YAML loader, validates the existing production table, and loads source data directly into it.
+- `etl_health.py` writes one final `SUCCESS` or `FAILURE` row to the configured legacy ETL health table after each enabled loader runs.
 - `graph_email.py` sends one summary email through Microsoft Graph after all loaders finish.
 
 ## Install and run
@@ -21,7 +21,7 @@ py -3.12 .\main_loader.py --config .\etl_config.yaml
 
 `.env.sample` is the only environment template tracked by Git and contains only the three Microsoft Graph authentication values: tenant ID, client ID, and client secret. Real `.env`, `.env.local`, and `.env.example` files are ignored. The loader does not automatically read those files; inject the values into the process through PowerShell, your scheduler, or an approved secret manager. Store all non-sensitive settings in YAML.
 
-The `truncate_append` mode requires the staging table to exist, truncates it once, and then appends each chunk while preserving the table definition and database defaults.
+The `truncate_append` mode requires the production table to exist, validates its columns, truncates it once, and then appends each chunk while preserving the table definition and database defaults. Use `append` to preserve existing rows.
 
 ## YAML behavior
 
@@ -33,18 +33,18 @@ default_destination:
     server: MainSqlServer
     database: Warehouse
     auth: {mode: trusted}
-  staging_schema: GHX
-  staging_load_mode: truncate_append
+  schema: GHX
+  load_mode: truncate_append
 
 loaders:
   - name: orders
     destination:
       connection:
         database: OtherWarehouse  # Keeps the default server/auth.
-      staging_table: orders_stg
+      table: orders
 ```
 
-The same effective connection is passed to `etl_health.py`, so health records automatically follow a loader-level server or database override. There is no separate health connection.
+Health logging uses its own configured connection because the centralized status table can be on a different SQL Server from the load destination.
 
 Console logs, run summaries, health records, and email timestamps use U.S. Eastern time (`America/New_York`) and automatically follow daylight-saving time.
 
@@ -69,7 +69,7 @@ columns:
 
 Supported common types are integer types, `decimal(p,s)`, `float`, `bit`, character types, `date`, `datetime`, `datetime2`, and `uniqueidentifier`.
 
-For file sources, optional post-load handling moves a fully successful file to an archive folder. A source file that fails during file access, parsing, or column conversion moves to an error folder. Destination database and production-promotion failures leave the inbound file in place for retry:
+For file sources, optional post-load handling moves a fully successful file to an archive folder. A source file that fails during file access, parsing, or column conversion moves to an error folder. Destination database failures leave the inbound file in place for retry:
 
 ```yaml
 source:
@@ -82,51 +82,36 @@ source:
 
 The destination folders must already exist. Existing files are never overwritten; a filename collision causes the move to fail and is included in the loader result.
 
-## Staging to production
+## Direct production load
 
-The `staging_to_prod.mode` values are:
+Before changing the destination, the loader requires the configured target columns to match the existing production table's column names, order, SQL types, and nullability. Unmapped columns are accepted only when SQL Server generates them through an identity, computed expression, or default constraint. A mismatch fails the load before `TRUNCATE TABLE` or any insert.
 
-- `none`: stop after staging.
-- `append`: insert all staging rows into an existing production table.
-- `truncate_insert`: truncate the production table, then insert all staging rows.
-- `stored_procedure`: execute a configured `schema.procedure` after staging.
-- `sql`: execute trusted SQL from the YAML file.
+Each production chunk commits independently to avoid one extremely large SQL Server transaction. If a later chunk fails, the loader reports failure and leaves the already committed chunks in place.
 
-For generic insert modes, the production table must already exist and have the configured target columns. Use `staging_load_mode: replace` or `truncate_append` so only the current source rows are promoted.
+## ETL health tracking
 
-Stored-procedure example:
-
-```yaml
-staging_to_prod:
-  mode: stored_procedure
-  procedure: dbo.usp_customers_staging_to_prod
-  parameters:
-    run_id: $RUN_ID
-```
-
-Each staging chunk commits independently to avoid one extremely large SQL Server transaction. Production promotion runs only after every staging chunk succeeds. If a later staging chunk fails, production is not changed and the loader is reported as failed.
-
-## ETL health framework
-
-Run `ETL_HEALTH_Scripts` 001 through 010 in numeric order in the destination database, then enable health logging with:
+The newer `ETL.RunHistory` start/finish calls are temporarily disabled in `main_loader.py`. For now, configure the centralized legacy table connection:
 
 ```yaml
 health:
   enabled: true
-  schema: ETL
+  connection:
+    server: 'YOUR_SERVER\YOUR_INSTANCE'
+    database: ETL
+    auth: {mode: trusted}
+  schema: dbo
+  table: ETL_Health_Status
   required: true
-  created_by: Procurement PMO ETL Loader
+  process_frequency: OnDemand
+  owner: ETL Owner
 
 loaders:
   - name: ExampleLoader
     health:
-      job_description: Load the source extract into staging
-      source_type: CSV
-      source_system: Source system name
-      load_type: FULL_REFRESH
+      data_flow_task_name: CSV_to_SQL_TruncateLoad
 ```
 
-The loader calls `ETL.usp_StartRun` and retains its numeric `ETLRunID`, then calls `ETL.usp_CompleteRun` with every required reconciliation input: received, extracted, staged, valid, invalid, duplicate, inserted, updated, deleted, unchanged, rejected, and skipped rows; batch and file counts; output paths; final status; and error details. Source object and target server/database/schema/table are derived from the loader configuration unless explicitly overridden under `health`. The generated network log path is recorded in `ETL.RunHistory.LogFilePath`. Set `required: true` to prevent a data load from proceeding without its health record.
+Each actual enabled loader execution inserts one row into `dbo.ETL_Health_Status` after the load attempt finishes. The row includes the resolved source file, completion time, production target, final status, loaded row count, log path, error, frequency, and owner. `STGTableName` is left null unless explicitly supplied under loader health settings. `--validate-only` and disabled loaders do not write status rows. Set `required: true` to report an otherwise successful load as failed when its status row cannot be written.
 
 ## Graph summary email
 

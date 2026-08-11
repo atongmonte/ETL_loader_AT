@@ -1,4 +1,4 @@
-"""YAML-driven source -> staging -> production ETL runner."""
+"""YAML-driven source -> production ETL runner."""
 
 from __future__ import annotations
 
@@ -24,7 +24,10 @@ from sqlalchemy import types as sql_types
 from sqlalchemy.dialects import mssql
 from sqlalchemy.engine import Connection, Engine
 
-from etl_health import record_finish, record_start
+from etl_health import record_legacy_status
+
+# Temporarily disabled: the v0 ETL.RunHistory start/finish framework.
+# from etl_health import record_finish, record_start
 from graph_email import send_summary_email
 
 LOGGER = logging.getLogger("etl")
@@ -35,15 +38,6 @@ TYPE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 FILE_SOURCE_TYPES = {"csv", "tsv", "excel", "json", "parquet"}
-HEALTH_SOURCE_TYPES = {"CSV", "SNOWFLAKE", "DATABASE", "API", "EXCEL", "OTHER"}
-HEALTH_LOAD_TYPES = {
-    "INSERT_ONLY",
-    "UPSERT",
-    "FULL_REFRESH",
-    "SNAPSHOT",
-    "INCREMENTAL",
-    "DELETE_INSERT",
-}
 US_EASTERN = ZoneInfo("America/New_York")
 LOG_DIRECTORY = Path(
     r"\\montefiore.org\centralfiles\data\Procurement PMO\_Data\CCX\LOGS"
@@ -305,9 +299,11 @@ def sqlalchemy_type(type_name: str) -> Any:
         }
         return types[name](length=length)
     if name == "date":
-        return sql_types.Date()
-    if name in {"datetime", "datetime2"}:
-        return mssql.DATETIME2()
+        return mssql.DATE()
+    if name == "datetime":
+        return sql_types.DateTime()
+    if name == "datetime2":
+        return mssql.DATETIME2(precision=int(first) if isinstance(first, int) else None)
     if name == "uniqueidentifier":
         return mssql.UNIQUEIDENTIFIER()
     raise ValueError(f"Unsupported SQL type: {type_name}")
@@ -315,6 +311,8 @@ def sqlalchemy_type(type_name: str) -> Any:
 
 def _is_null(value: Any) -> bool:
     if value is None:
+        return True
+    if isinstance(value, str) and not value.strip():
         return True
     result = pd.isna(value)
     return bool(result) if not hasattr(result, "__len__") else False
@@ -379,63 +377,102 @@ def quote_table(connection: Connection, schema: str, table: str) -> str:
     return f"{quote(schema)}.{quote(table)}"
 
 
-def staging_to_production(
+def _type_signature(type_name: str) -> tuple[str, int | str | None, int | None]:
+    """Return a normalized SQL type signature for strict comparisons."""
+
+    name, first, second = parse_sql_type(type_name)
+    if name == "datetime2" and first is None:
+        first = 7
+    return name, first, second
+
+
+def _database_type_signature(connection: Connection, database_type: Any) -> tuple[str, int | str | None, int | None]:
+    rendered = database_type.compile(dialect=connection.dialect)
+    rendered = re.split(r"\s+COLLATE\s+", rendered, maxsplit=1, flags=re.IGNORECASE)[0]
+    return _type_signature(rendered)
+
+
+def validate_destination_alignment(
     connection: Connection,
-    loader: dict[str, Any],
     destination: dict[str, Any],
-    target_columns: list[str],
-    run_id: str,
+    columns: list[dict[str, Any]],
 ) -> None:
-    """Promote staging rows with a generic insert, stored procedure, or SQL."""
+    """Require the configured columns to match the existing production table."""
 
-    promotion = loader.get("staging_to_prod", {})
-    mode = promotion.get("mode", "none")
-    if mode == "none":
-        return
-    if mode == "stored_procedure":
-        procedure_parts = promotion["procedure"].split(".")
-        if len(procedure_parts) != 2 or not all(IDENTIFIER.fullmatch(part) for part in procedure_parts):
-            raise ValueError("procedure must be in schema.procedure format")
-        quote = connection.dialect.identifier_preparer.quote
-        procedure = f"{quote(procedure_parts[0])}.{quote(procedure_parts[1])}"
-        parameters = {
-            key: run_id if value == "$RUN_ID" else value
-            for key, value in promotion.get("parameters", {}).items()
-        }
-        for name in parameters:
-            if not IDENTIFIER.fullmatch(name):
-                raise ValueError(f"Invalid stored-procedure parameter: {name}")
-        assignments = ", ".join(f"@{name} = :{name}" for name in parameters)
-        command = f"EXEC {procedure}" + (f" {assignments}" if assignments else "")
-        connection.execute(text(command), parameters)
-        return
-    if mode == "sql":
-        parameters = {
-            key: run_id if value == "$RUN_ID" else value
-            for key, value in promotion.get("parameters", {}).items()
-        }
-        connection.execute(text(promotion["sql"]), parameters)
-        return
-    if mode not in {"append", "truncate_insert"}:
-        raise ValueError(f"Unsupported staging_to_prod mode: {mode}")
+    schema = destination.get("schema", "dbo")
+    table_name = destination["table"]
+    inspector = inspect(connection)
+    if not inspector.has_table(table_name, schema=schema):
+        raise ValueError(
+            f"Production table {schema}.{table_name} does not exist; create it before loading"
+        )
 
-    staging = quote_table(
-        connection,
-        destination.get("staging_schema", "stg"),
-        destination["staging_table"],
-    )
-    production = quote_table(
-        connection,
-        promotion.get("production_schema", "dbo"),
-        promotion["production_table"],
-    )
-    quote = connection.dialect.identifier_preparer.quote
-    column_list = ", ".join(quote(name) for name in target_columns)
-    if mode == "truncate_insert":
-        connection.execute(text(f"TRUNCATE TABLE {production}"))
-    connection.execute(
-        text(f"INSERT INTO {production} ({column_list}) SELECT {column_list} FROM {staging}")
-    )
+    database_columns = inspector.get_columns(table_name, schema=schema)
+    database_by_name = {column["name"].casefold(): column for column in database_columns}
+    configured_names = [
+        column.get("target", column.get("name", column.get("source")))
+        for column in columns
+    ]
+    configured_keys = {name.casefold() for name in configured_names}
+    errors: list[str] = []
+
+    missing = [name for name in configured_names if name.casefold() not in database_by_name]
+    if missing:
+        errors.append(f"columns not found in production: {', '.join(missing)}")
+
+    generated_columns: set[str] = set()
+    for database_column in database_columns:
+        key = database_column["name"].casefold()
+        if key in configured_keys:
+            continue
+        is_generated = bool(
+            database_column.get("default") is not None
+            or database_column.get("computed")
+            or database_column.get("identity")
+            or database_column.get("autoincrement") is True
+        )
+        if is_generated:
+            generated_columns.add(key)
+        else:
+            errors.append(
+                f"production column {database_column['name']} has no configured source mapping"
+            )
+
+    expected_order = [
+        column["name"]
+        for column in database_columns
+        if column["name"].casefold() not in generated_columns
+    ]
+    if not missing and configured_names != expected_order:
+        errors.append(
+            "column order differs (configured: "
+            + ", ".join(configured_names)
+            + "; production: "
+            + ", ".join(expected_order)
+            + ")"
+        )
+
+    for configured_column, configured_name in zip(columns, configured_names):
+        database_column = database_by_name.get(configured_name.casefold())
+        if database_column is None:
+            continue
+        configured_type = _type_signature(configured_column["type"])
+        database_type = _database_type_signature(connection, database_column["type"])
+        if configured_type != database_type:
+            errors.append(
+                f"{configured_name} type is {configured_column['type']} in configuration "
+                f"but {database_column['type']} in production"
+            )
+        configured_nullable = configured_column.get("nullable", True)
+        if configured_nullable != database_column.get("nullable", True):
+            errors.append(
+                f"{configured_name} nullable is {configured_nullable} in configuration "
+                f"but {database_column.get('nullable', True)} in production"
+            )
+
+    if errors:
+        target = f"{schema}.{table_name}"
+        raise ValueError(f"Destination alignment failed for {target}: " + "; ".join(errors))
 
 
 def validate_loader(loader: dict[str, Any], destination: dict[str, Any]) -> None:
@@ -444,18 +481,18 @@ def validate_loader(loader: dict[str, Any], destination: dict[str, Any]) -> None
             raise ValueError(f"Loader is missing {key}")
     if not IDENTIFIER.fullmatch(loader["name"]):
         raise ValueError(f"Invalid loader name: {loader['name']}")
-    if not destination.get("connection") or not destination.get("staging_table"):
-        raise ValueError(f"Loader {loader['name']} needs destination connection/staging_table")
-    quote_names = [destination.get("staging_schema", "stg"), destination["staging_table"]]
+    if not destination.get("connection") or not destination.get("table"):
+        raise ValueError(f"Loader {loader['name']} needs destination connection/table")
+    quote_names = [destination.get("schema", "dbo"), destination["table"]]
     if not all(IDENTIFIER.fullmatch(value) for value in quote_names):
-        raise ValueError(f"Loader {loader['name']} has an invalid staging identifier")
-    if destination.get("staging_load_mode", "replace") not in {
-        "fail",
-        "replace",
+        raise ValueError(f"Loader {loader['name']} has an invalid destination identifier")
+    if destination.get("load_mode", "truncate_append") not in {
         "append",
         "truncate_append",
     }:
-        raise ValueError(f"Loader {loader['name']} has an invalid staging_load_mode")
+        raise ValueError(
+            f"Loader {loader['name']} destination.load_mode must be append or truncate_append"
+        )
     source = loader["source"]
     source_type = source.get("type", "csv").lower()
     if source_type == "sql":
@@ -497,61 +534,17 @@ def validate_loader(loader: dict[str, Any], destination: dict[str, Any]) -> None
         target_names.add(target_name.casefold())
         sqlalchemy_type(column["type"])
 
-    promotion = loader.get("staging_to_prod", {})
-    mode = promotion.get("mode", "none")
-    if mode not in {"none", "append", "truncate_insert", "stored_procedure", "sql"}:
-        raise ValueError(f"Loader {loader['name']} has invalid staging_to_prod mode {mode}")
-    if mode in {"append", "truncate_insert"}:
-        if not promotion.get("production_table"):
-            raise ValueError(f"Loader {loader['name']} needs production_table")
-        if destination.get("staging_load_mode", "replace") not in {
-            "replace",
-            "truncate_append",
-        }:
-            raise ValueError(
-                f"Loader {loader['name']} must use staging_load_mode: replace or "
-                "truncate_append "
-                "with generic staging-to-production modes"
-            )
-    if mode == "stored_procedure" and not promotion.get("procedure"):
-        raise ValueError(f"Loader {loader['name']} needs a procedure")
-    if mode == "sql" and not promotion.get("sql"):
-        raise ValueError(f"Loader {loader['name']} needs staging_to_prod.sql")
-
-
 def validate_health(health: dict[str, Any], loader_name: str) -> None:
-    """Validate values constrained by ETL.RunHistory before opening a connection."""
+    """Validate the legacy ETL health-table configuration."""
 
     if not health.get("enabled", False):
         return
-    schema = health.get("schema", "ETL")
-    if not isinstance(schema, str) or not IDENTIFIER.fullmatch(schema):
-        raise ValueError(f"Loader {loader_name} has an invalid health schema")
-    source_type = health.get("source_type")
-    if source_type is not None and source_type not in HEALTH_SOURCE_TYPES:
-        raise ValueError(
-            f"Loader {loader_name} health.source_type must be one of "
-            f"{', '.join(sorted(HEALTH_SOURCE_TYPES))}"
-        )
-    load_type = health.get("load_type")
-    if load_type is not None and load_type not in HEALTH_LOAD_TYPES:
-        raise ValueError(
-            f"Loader {loader_name} health.load_type must be one of "
-            f"{', '.join(sorted(HEALTH_LOAD_TYPES))}"
-        )
-    for key in ("target_schema", "target_table"):
-        value = health.get(key)
-        if value is not None and (
-            not isinstance(value, str) or not IDENTIFIER.fullmatch(value)
-        ):
-            raise ValueError(f"Loader {loader_name} health.{key} is invalid")
-    parent_run_id = health.get("parent_etl_run_id")
-    if parent_run_id is not None and (
-        not isinstance(parent_run_id, int) or parent_run_id <= 0
-    ):
-        raise ValueError(
-            f"Loader {loader_name} health.parent_etl_run_id must be a positive integer"
-        )
+    for key, default in (("schema", "dbo"), ("table", "ETL_Health_Status")):
+        value = health.get(key, default)
+        if not isinstance(value, str) or not IDENTIFIER.fullmatch(value):
+            raise ValueError(f"Loader {loader_name} has an invalid health {key}")
+    if not isinstance(health.get("connection"), dict):
+        raise ValueError(f"Loader {loader_name} health.connection must be configured")
 
 
 def load_configuration(path: Path) -> tuple[dict[str, Any], list[tuple[dict[str, Any], dict[str, Any]]]]:
@@ -582,11 +575,10 @@ def run_loader(
     destination: dict[str, Any],
     default_health: dict[str, Any],
     config_dir: Path,
-    run_id: str,
     log_path: Path,
 ) -> dict[str, Any]:
     started = datetime.now(US_EASTERN)
-    target = f"{destination.get('staging_schema', 'stg')}.{destination['staging_table']}"
+    target = f"{destination.get('schema', 'dbo')}.{destination['table']}"
     result = {
         "loader": loader["name"],
         "target": target,
@@ -599,10 +591,10 @@ def run_loader(
         "file_action": None,
     }
     engine: Engine | None = None
+    health_engine: Engine | None = None
     source_chunks: Iterator[pd.DataFrame] | None = None
     failure_phase = "destination"
     health = deep_merge(default_health, loader.get("health", {}))
-    health_run_id: int | None = None
     runtime_loader = copy.deepcopy(loader)
     try:
         if loader["source"].get("type", "csv").lower() != "sql":
@@ -611,14 +603,8 @@ def run_loader(
             )
             runtime_loader["source"].pop("filename_pattern", None)
         engine = build_engine(destination["connection"], fast=True)
-        try:
-            health_run_id = record_start(
-                engine, health, runtime_loader, destination, config_dir
-            )
-        except Exception as exc:
-            if health.get("required", False):
-                raise
-            result["warnings"].append(f"Health start failed: {str(exc)[:500]}")
+        # Temporarily disabled: record_start(...) for ETL.RunHistory.
+        # The legacy status table is written once, after this load attempt finishes.
 
         batch_size = int(destination.get("batch_size", 1000))
         source_chunks = iter_source_chunks(runtime_loader["source"], config_dir, batch_size)
@@ -633,9 +619,9 @@ def run_loader(
         if first_frame is None and not destination.get("allow_empty", False):
             raise ValueError("Source returned zero rows; set allow_empty: true to permit it")
 
-        staging_schema = destination.get("staging_schema", "stg")
-        staging_table = destination["staging_table"]
-        staging_mode = destination.get("staging_load_mode", "replace")
+        destination_schema = destination.get("schema", "dbo")
+        destination_table = destination["table"]
+        load_mode = destination.get("load_mode", "truncate_append")
         target_columns = [
             column.get("target", column.get("name", column.get("source")))
             for column in loader["columns"]
@@ -646,27 +632,21 @@ def run_loader(
         }
 
         failure_phase = "destination"
-        if staging_mode == "truncate_append":
-            with engine.begin() as connection:
-                if not inspect(connection).has_table(
-                    staging_table, schema=staging_schema
-                ):
-                    raise ValueError(
-                        f"Staging table {staging_schema}.{staging_table} does not exist; "
-                        "run its CREATE TABLE script first"
-                    )
+        with engine.begin() as connection:
+            validate_destination_alignment(connection, destination, loader["columns"])
+            if load_mode == "truncate_append":
                 connection.execute(
                     text(
-                        f"TRUNCATE TABLE {quote_table(connection, staging_schema, staging_table)}"
+                        f"TRUNCATE TABLE {quote_table(connection, destination_schema, destination_table)}"
                     )
                 )
 
         def write_chunk(frame: pd.DataFrame, if_exists: str) -> None:
             with engine.begin() as connection:
                 frame.to_sql(
-                    staging_table,
+                    destination_table,
                     connection,
-                    schema=staging_schema,
+                    schema=destination_schema,
                     if_exists=if_exists,
                     index=False,
                     dtype=destination_types,
@@ -676,8 +656,7 @@ def run_loader(
         chunk_number = 0
         if first_frame is not None:
             failure_phase = "destination"
-            first_write_mode = "append" if staging_mode == "truncate_append" else staging_mode
-            write_chunk(first_frame, first_write_mode)
+            write_chunk(first_frame, "append")
             result["rows"] += len(first_frame)
             chunk_number = 1
             result["batches"] = chunk_number
@@ -695,25 +674,12 @@ def run_loader(
             result["batches"] = chunk_number
             if chunk_number % 10 == 0:
                 LOGGER.info(
-                    "Loader %s committed %s staging rows",
+                    "Loader %s committed %s production rows",
                     loader["name"],
                     f"{result['rows']:,}",
                 )
             failure_phase = "source"
 
-        if first_frame is None and staging_mode in {"replace", "fail"}:
-            failure_phase = "destination"
-            write_chunk(pd.DataFrame(columns=target_columns), staging_mode)
-
-        failure_phase = "promotion"
-        with engine.begin() as connection:
-            staging_to_production(
-                connection,
-                loader,
-                destination,
-                target_columns,
-                run_id,
-            )
         result["status"] = "SUCCESS"
     except Exception as exc:
         result["error"] = str(exc).replace("\r", " ").replace("\n", " ")[:2000]
@@ -752,41 +718,28 @@ def run_loader(
 
         finished = datetime.now(US_EASTERN)
         result["finished_at"] = finished.isoformat()
-        if engine is not None:
+        if health.get("enabled", False):
             try:
-                successful = result["status"] == "SUCCESS"
-                failure_status = {
-                    "source": "FAILED_EXTRACTION",
-                    "destination": "FAILED_DATABASE_LOAD",
-                    "promotion": "FAILED_DATABASE_LOAD",
-                    "file_move": "FAILED",
-                }.get(failure_phase, "FAILED")
-                record_finish(
-                    engine,
+                # Temporarily disabled: record_finish(...) for ETL.RunHistory.
+                health_engine = build_engine(health["connection"])
+                record_legacy_status(
+                    health_engine,
                     health,
-                    health_run_id,
-                    {
-                        "rows_received": result["rows"],
-                        "rows_extracted": result["rows"],
-                        "rows_staged": result["rows"],
-                        "rows_valid": result["rows"],
-                        "rows_inserted": result["rows"] if successful else 0,
-                        "batch_count": result["batches"],
-                        "file_count": int(
-                            runtime_loader["source"].get("type", "csv").lower() != "sql"
-                        ),
-                        "log_file_path": str(log_path),
-                        "run_status": "COMPLETED" if successful else failure_status,
-                        "error_code": None if successful else failure_phase.upper(),
-                        "error_message": result["error"],
-                        "validate_reconciliation": successful,
-                    },
+                    runtime_loader,
+                    destination,
+                    result,
+                    finished,
+                    log_path,
                 )
             except Exception as exc:
-                result["warnings"].append(f"Health finish failed: {str(exc)[:500]}")
+                result["warnings"].append(f"Legacy health update failed: {str(exc)[:500]}")
                 if health.get("required", False) and result["status"] == "SUCCESS":
                     result["status"] = "FAILED"
-                    result["error"] = "Required health finish update failed"
+                    result["error"] = "Required legacy health update failed"
+            finally:
+                if health_engine is not None:
+                    health_engine.dispose()
+        if engine is not None:
             try:
                 engine.dispose()
             except Exception as exc:
@@ -805,7 +758,7 @@ def run(config_path: Path, log_path: Path) -> tuple[dict[str, Any], bool]:
             results.append(
                 {
                     "loader": loader["name"],
-                    "target": f"{destination.get('staging_schema', 'stg')}.{destination['staging_table']}",
+                    "target": f"{destination.get('schema', 'dbo')}.{destination['table']}",
                     "status": "SKIPPED",
                     "rows": 0,
                     "started_at": now,
@@ -822,7 +775,6 @@ def run(config_path: Path, log_path: Path) -> tuple[dict[str, Any], bool]:
                 destination,
                 config.get("health", {}),
                 config_path.parent,
-                run_id,
                 log_path,
             )
         )

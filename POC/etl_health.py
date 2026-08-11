@@ -41,8 +41,8 @@ def _target_identity(
     connection = destination.get("connection", {})
     target_server = health.get("target_server") or connection.get("server") or engine.url.host
     target_database = health.get("target_database") or connection.get("database") or engine.url.database
-    target_schema = health.get("target_schema") or destination.get("staging_schema", "stg")
-    target_table = health.get("target_table") or destination["staging_table"]
+    target_schema = health.get("target_schema") or destination.get("schema", "dbo")
+    target_table = health.get("target_table") or destination["table"]
     if not target_database:
         raise ValueError("ETL health requires target_database when it cannot be derived")
     return target_server, target_database, target_schema, target_table
@@ -145,3 +145,81 @@ def record_finish(
     with engine.begin() as connection:
         procedure = _procedure_name(connection, health_config, "usp_CompleteRun")
         connection.execute(text(f"EXEC {procedure}\n    {assignments}"), parameters)
+
+
+def record_legacy_status(
+    engine: Engine,
+    health_config: dict[str, Any],
+    loader: dict[str, Any],
+    destination: dict[str, Any],
+    result: dict[str, Any],
+    finished_at: Any,
+    log_file_path: Path,
+) -> None:
+    """Insert one completed load attempt into dbo.ETL_Health_Status."""
+
+    if not health_config.get("enabled", False):
+        return
+
+    schema = health_config.get("schema", "dbo")
+    table_name = health_config.get("table", "ETL_Health_Status")
+    if not _IDENTIFIER.fullmatch(schema) or not _IDENTIFIER.fullmatch(table_name):
+        raise ValueError("Legacy health schema and table must be simple SQL identifiers")
+
+    connection_config = destination.get("connection", {})
+    loader_health = loader.get("health", {})
+    source = loader["source"]
+    source_path = source.get("path") or source.get("query") or source.get("object")
+    target_server = connection_config.get("server") or engine.url.host or ""
+    target_database = connection_config.get("database") or engine.url.database or ""
+    target_schema = destination.get("schema", "dbo")
+    target_table = destination["table"]
+    target_name = loader_health.get("target_table_name") or (
+        f"{target_server}.[{target_database}].[{target_schema}].[{target_table}]"
+    )
+    staging_name = loader_health.get("stg_table_name")
+
+    package_path = health_config.get("package_path") or str(
+        Path(__file__).with_name("main_loader.py")
+    )
+    parameters = {
+        "PackageName": loader["name"],
+        "DataFlowTaskName": loader_health.get(
+            "data_flow_task_name", "CSV_to_SQL_TruncateLoad"
+        ),
+        "SourceFilePath": str(source_path) if source_path is not None else None,
+        "LastRunTime": finished_at.replace(tzinfo=None),
+        "TargetTableName": target_name[:255],
+        "TaskStatus": "SUCCESS" if result["status"] == "SUCCESS" else "FAILURE",
+        "RowCount": result["rows"],
+        "PackagePath": package_path,
+        "LogFilePath": str(log_file_path),
+        "STGTableName": staging_name[:255] if staging_name else None,
+        "ProcessFrequency": loader_health.get("process_frequency")
+        or health_config.get("process_frequency", "OnDemand"),
+        "Error": result.get("error"),
+        "Owner": loader_health.get("owner") or health_config.get("owner"),
+    }
+
+    quote = engine.dialect.identifier_preparer.quote
+    qualified_table = f"{quote(schema)}.{quote(table_name)}"
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                f"""
+INSERT INTO {qualified_table}
+(
+    PackageName, DataFlowTaskName, SourceFilePath, LastRunTime,
+    TargetTableName, TaskStatus, Row_Count, PackagePath, LogFilePath,
+    STGTableName, ProcessFrequency, Error, Owner
+)
+VALUES
+(
+    :PackageName, :DataFlowTaskName, :SourceFilePath, :LastRunTime,
+    :TargetTableName, :TaskStatus, :RowCount, :PackagePath, :LogFilePath,
+    :STGTableName, :ProcessFrequency, :Error, :Owner
+)
+"""
+            ),
+            parameters,
+        )

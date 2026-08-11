@@ -12,18 +12,26 @@ default_destination:
       mode: trusted
     encrypt: true
     trust_server_certificate: false
-  staging_schema: STG
-  staging_load_mode: truncate_append
+  schema: dbo
+  load_mode: truncate_append
   batch_size: 10000
   allow_empty: false
 
-# Install ETL_HEALTH_Scripts 001-010 in the destination database first.
-# Health uses the same effective connection as each loader.
+# Optional legacy status table. It is written only during an actual ETL run;
+# --validate-only does not write a status row.
 health:
   enabled: false
-  schema: ETL
+  connection:
+    server: YOUR_HEALTH_SQL_SERVER
+    database: ETL
+    auth: {mode: trusted}
+    encrypt: true
+    trust_server_certificate: false
+  schema: dbo
+  table: ETL_Health_Status
   required: false
-  created_by: Sample ETL Loader
+  process_frequency: OnDemand
+  owner: ETL Owner
 
 email:
   enabled: false
@@ -43,12 +51,7 @@ loaders:
   - name: SampleDelimitedFile
     enabled: true
     health:
-      job_description: Load the sample delimited file into staging
-      source_type: CSV
-      source_system: Sample Source System
-      # source_object and target identity are derived unless overridden here.
-      load_type: FULL_REFRESH
-      parent_etl_run_id: null
+      data_flow_task_name: CSV_to_SQL_TruncateLoad
     source:
       type: csv
       path: '\\your-file-server\share\inbound'
@@ -64,7 +67,7 @@ loaders:
         on_bad_lines: error
 
     destination:
-      staging_table: SampleData_Stg
+      table: SampleData
 
     # Replace these examples with the source header, destination column,
     # SQL type, and nullability required by your loader.
@@ -73,6 +76,3 @@ loaders:
       - {source: Description, target: Description, type: "varchar(500)", nullable: true}
       - {source: Amount, target: Amount, type: "decimal(19,4)", nullable: true}
       - {source: Effective_Date, target: EffectiveDate, type: date, nullable: true}
-
-    staging_to_prod:
-      mode: none

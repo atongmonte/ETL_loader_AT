@@ -70,7 +70,7 @@ BEGIN
         [SourceContractType]               varchar(500) NOT NULL,
         [ManufacturerEID]                  varchar(500) NULL,
         [VendorEID]                        varchar(500) NULL,
-        [LastUpdate]                       datetime2(3) NOT NULL
+        [Load_TS]                       datetime2(3) NOT NULL
             CONSTRAINT [DF_STG_ContractLineDetails_LastUpdate]
             DEFAULT (SYSUTCDATETIME())
     );
