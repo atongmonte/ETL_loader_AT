@@ -102,7 +102,7 @@ direct_load:
 
 Before changing production, the loader validates the entire source: required columns, conversions, integer and decimal bounds, string lengths, nullability, empty-file policy, and configured primary-key duplicates across all chunks. Configure `pk_check: []` only when the table genuinely has no enforced or approved business key.
 
-The loader also requires configured target columns to match the live production table's names, order, SQL types, sizes/precision, and nullability. Unmapped columns are accepted only when SQL Server generates them through an identity, computed expression, or default constraint. This permits the production `Load_TS` default while rejecting unmapped business columns.
+The loader also requires configured target columns to match the live production table's names, order, SQL types, sizes/precision, and nullability. Unmapped columns are accepted when SQL Server generates them through an identity, computed expression, or default constraint, or when the column is nullable and can safely receive `NULL`. This permits the production `Load_TS` default and the staging table's optional `LAST_UPDATE` while rejecting unmapped required business columns.
 
 After preflight, schema validation, `TRUNCATE TABLE`, every batched insert, and final `COUNT(*)` reconciliation execute inside one database transaction. Prepared rows, inserted rows, and the final production count must agree. Any failure rolls the truncate and all inserts back together.
 

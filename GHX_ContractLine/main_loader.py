@@ -11,8 +11,8 @@ import re
 import shutil
 import sys
 import uuid
-from datetime import datetime
-from decimal import Decimal
+from datetime import date, datetime
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from collections.abc import Iterator
 from typing import Any
@@ -319,23 +319,57 @@ def _is_null(value: Any) -> bool:
     return bool(result) if not hasattr(result, "__len__") else False
 
 
-def convert_columns(frame: pd.DataFrame, columns: list[dict[str, Any]]) -> pd.DataFrame:
+def convert_columns(
+    frame: pd.DataFrame,
+    columns: list[dict[str, Any]],
+    *,
+    validate_values: bool = True,
+    load_date: date | None = None,
+) -> pd.DataFrame:
     """Select, rename, and convert the configured columns."""
 
     actual = {str(name).casefold(): name for name in frame.columns}
+    if not validate_values:
+        output = pd.DataFrame(index=frame.index)
+        for column in columns:
+            generated = column.get("generated")
+            source_name = column.get("source", column.get("name"))
+            target_name = column.get("target", column.get("name", source_name))
+            if generated == "load_date":
+                output[target_name] = load_date or datetime.now(US_EASTERN).date()
+                continue
+            if not source_name or source_name.casefold() not in actual:
+                raise ValueError(f"Missing source column: {source_name}")
+            if not target_name or not IDENTIFIER.fullmatch(target_name):
+                raise ValueError(f"Invalid target column: {target_name}")
+            output[target_name] = frame[actual[source_name.casefold()]]
+        return output
+
     output = pd.DataFrame(index=frame.index)
     for column in columns:
+        generated = column.get("generated")
         source_name = column.get("source", column.get("name"))
         target_name = column.get("target", column.get("name", source_name))
+        if generated == "load_date":
+            output[target_name] = load_date or datetime.now(US_EASTERN).date()
+            continue
         if not source_name or source_name.casefold() not in actual:
             raise ValueError(f"Missing source column: {source_name}")
         if not target_name or not IDENTIFIER.fullmatch(target_name):
             raise ValueError(f"Invalid target column: {target_name}")
         type_name = column["type"]
         name, first, second = parse_sql_type(type_name)
+        is_character = name in {"varchar", "char", "nvarchar", "nchar"}
         converted = []
         for value in frame[actual[source_name.casefold()]]:
-            if _is_null(value):
+            # Preserve source text exactly, including empty strings. SQL Server
+            # VARCHAR columns can store '' even when they are NOT NULL, and the
+            # raw staging load must not turn blanks into database NULL values.
+            if is_character and isinstance(value, str):
+                if isinstance(first, int) and len(value) > first:
+                    raise ValueError(f"Column {source_name} exceeds length {first}")
+                converted.append(value)
+            elif _is_null(value):
                 if not column.get("nullable", True):
                     raise ValueError(f"Column {source_name} does not allow NULL")
                 converted.append(None)
@@ -359,10 +393,11 @@ def convert_columns(frame: pd.DataFrame, columns: list[dict[str, Any]]) -> pd.Da
                     raise ValueError(f"Column {source_name} contains a non-finite decimal")
                 precision = int(first or 18)
                 scale = int(second or 0)
+                quantum = Decimal(1).scaleb(-scale)
+                number = number.quantize(quantum, rounding=ROUND_HALF_UP)
                 _, digits, exponent = number.as_tuple()
-                fractional_digits = max(-exponent, 0)
                 integer_digits = max(len(digits) + exponent, 0)
-                if fractional_digits > scale or integer_digits > precision - scale:
+                if integer_digits > precision - scale:
                     raise ValueError(
                         f"Column {source_name} value {value!r} exceeds decimal({precision},{scale})"
                     )
@@ -400,7 +435,7 @@ def convert_columns(frame: pd.DataFrame, columns: list[dict[str, Any]]) -> pd.Da
                     raise ValueError(
                         f"Column {source_name} contains an invalid uniqueidentifier"
                     ) from exc
-            elif name in {"varchar", "char", "nvarchar", "nchar"}:
+            elif is_character:
                 text_value = str(value)
                 if isinstance(first, int) and len(text_value) > first:
                     raise ValueError(f"Column {source_name} exceeds length {first}")
@@ -419,16 +454,23 @@ def prepare_source(
     direct_load = loader["direct_load"]
     batch_size = int(direct_load.get("batch_size", 10000))
     primary_key = list(direct_load.get("pk_check", []))
+    validate_source = direct_load.get("validate_source", True)
+    load_date = datetime.now(US_EASTERN).date()
     prepared: list[pd.DataFrame] = []
     seen_keys: set[tuple[Any, ...]] = set()
     duplicate_samples: list[tuple[Any, ...]] = []
     source_chunks = iter_source_chunks(loader["source"], config_dir, batch_size)
     try:
         for raw_frame in source_chunks:
-            frame = convert_columns(raw_frame, loader["columns"])
+            frame = convert_columns(
+                raw_frame,
+                loader["columns"],
+                validate_values=validate_source,
+                load_date=load_date,
+            )
             if frame.empty:
                 continue
-            if primary_key:
+            if validate_source and primary_key:
                 missing_keys = [name for name in primary_key if name not in frame.columns]
                 if missing_keys:
                     raise ValueError(
@@ -476,10 +518,17 @@ def _type_signature(type_name: str) -> tuple[str, int | str | None, int | None]:
     return name, first, second
 
 
-def _database_type_signature(connection: Connection, database_type: Any) -> tuple[str, int | str | None, int | None]:
+def _database_type_signature(
+    connection: Connection,
+    database_type: Any,
+    datetime_precision: int | None = None,
+) -> tuple[str, int | str | None, int | None]:
     rendered = database_type.compile(dialect=connection.dialect)
     rendered = re.split(r"\s+COLLATE\s+", rendered, maxsplit=1, flags=re.IGNORECASE)[0]
-    return _type_signature(rendered)
+    signature = _type_signature(rendered)
+    if signature[0] == "datetime2" and datetime_precision is not None:
+        return signature[0], datetime_precision, signature[2]
+    return signature
 
 
 def validate_destination_alignment(
@@ -499,6 +548,25 @@ def validate_destination_alignment(
 
     database_columns = inspector.get_columns(table_name, schema=schema)
     database_by_name = {column["name"].casefold(): column for column in database_columns}
+    datetime_precision_by_name: dict[str, int] = {}
+    if any(
+        isinstance(column["type"], mssql.DATETIME2)
+        and getattr(column["type"], "precision", None) is None
+        for column in database_columns
+    ):
+        precision_rows = connection.execute(
+            text(
+                "SELECT COLUMN_NAME, DATETIME_PRECISION "
+                "FROM INFORMATION_SCHEMA.COLUMNS "
+                "WHERE TABLE_SCHEMA = :schema AND TABLE_NAME = :table"
+            ),
+            {"schema": schema, "table": table_name},
+        )
+        datetime_precision_by_name = {
+            str(row[0]).casefold(): int(row[1])
+            for row in precision_rows
+            if row[1] is not None
+        }
     configured_names = [
         column.get("target", column.get("name", column.get("source")))
         for column in columns
@@ -521,7 +589,7 @@ def validate_destination_alignment(
             or database_column.get("identity")
             or database_column.get("autoincrement") is True
         )
-        if is_generated:
+        if is_generated or database_column.get("nullable", True):
             generated_columns.add(key)
         else:
             errors.append(
@@ -547,7 +615,11 @@ def validate_destination_alignment(
         if database_column is None:
             continue
         configured_type = _type_signature(configured_column["type"])
-        database_type = _database_type_signature(connection, database_column["type"])
+        database_type = _database_type_signature(
+            connection,
+            database_column["type"],
+            datetime_precision_by_name.get(configured_name.casefold()),
+        )
         if configured_type != database_type:
             errors.append(
                 f"{configured_name} type is {configured_column['type']} in configuration "
@@ -588,6 +660,10 @@ def validate_loader(loader: dict[str, Any], destination: dict[str, Any]) -> None
         raise ValueError(f"Loader {loader['name']} direct_load.batch_size must be positive")
     if not isinstance(direct_load.get("allow_empty", False), bool):
         raise ValueError(f"Loader {loader['name']} direct_load.allow_empty must be true or false")
+    if not isinstance(direct_load.get("validate_source", True), bool):
+        raise ValueError(
+            f"Loader {loader['name']} direct_load.validate_source must be true or false"
+        )
     source = loader["source"]
     source_type = source.get("type", "csv").lower()
     if source_type == "sql":
@@ -618,9 +694,14 @@ def validate_loader(loader: dict[str, Any], destination: dict[str, Any]) -> None
 
     target_names: set[str] = set()
     for column in loader["columns"]:
+        generated = column.get("generated")
         source_name = column.get("source", column.get("name"))
         target_name = column.get("target", column.get("name", source_name))
-        if not isinstance(source_name, str) or not source_name:
+        if generated not in (None, "load_date"):
+            raise ValueError(
+                f"Loader {loader['name']} has unsupported generated value {generated}"
+            )
+        if generated is None and (not isinstance(source_name, str) or not source_name):
             raise ValueError(f"Loader {loader['name']} has a column without a source/name")
         if not isinstance(target_name, str) or not IDENTIFIER.fullmatch(target_name):
             raise ValueError(f"Loader {loader['name']} has invalid target column {target_name}")
@@ -803,9 +884,15 @@ def run_loader(
 
         failure_phase = "source"
         prepared_frames, source_rows = prepare_source(runtime_loader, config_dir)
+        source_action = (
+            "preflight validated"
+            if loader["direct_load"].get("validate_source", True)
+            else "prepared without row-level validation"
+        )
         LOGGER.info(
-            "Loader %s preflight validated %s source rows",
+            "Loader %s %s %s source rows",
             loader["name"],
+            source_action,
             f"{source_rows:,}",
         )
 

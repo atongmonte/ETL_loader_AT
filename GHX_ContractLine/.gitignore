@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+!.env.sample
+etl_config.yaml
+etl_config.local.yaml
+*.log
