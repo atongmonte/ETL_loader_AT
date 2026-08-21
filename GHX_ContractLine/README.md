@@ -21,7 +21,7 @@ py -3.12 .\main_loader.py --config .\etl_config.yaml
 
 `etl_config.sample.yaml` contains placeholders only. Copy it to the Git-ignored `etl_config.yaml`, then put real server, database, source-file, destination, sender, and recipient settings in that local YAML file.
 
-`.env.sample` is the only environment template tracked by Git and contains only the three Microsoft Graph authentication values: tenant ID, client ID, and client secret. Real `.env`, `.env.local`, and `.env.example` files are ignored. The loader does not automatically read those files; inject the values into the process through PowerShell, your scheduler, or an approved secret manager. Store all non-sensitive settings in YAML.
+`.env.sample` is the only environment template tracked by Git and contains only the three Microsoft Graph authentication values: tenant ID, client ID, and client secret. Real `.env`, `.env.local`, and `.env.example` files are ignored. At startup, the loader automatically reads `.env` from the directory containing the selected YAML file. Variables already supplied by PowerShell, the scheduler, or a secret manager take precedence. Store all non-sensitive settings in YAML.
 
 `--validate-only` checks YAML without accessing source files, databases, or the shared log folder. `--preflight` reads and validates the complete source plus live production metadata without writing anything. `--table-info` prints the live production columns and generated-column status. Add `--loader LoaderName` to limit either live read-only command to one loader.
 

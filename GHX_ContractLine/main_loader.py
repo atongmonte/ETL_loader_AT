@@ -93,6 +93,32 @@ def expand_environment(value: Any) -> Any:
     return value
 
 
+def load_dotenv(path: Path) -> None:
+    """Load KEY=VALUE settings without replacing process environment values."""
+
+    if not path.is_file():
+        return
+    with path.open("r", encoding="utf-8-sig") as stream:
+        for line_number, raw_line in enumerate(stream, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            if "=" not in line:
+                raise ValueError(f"Invalid .env entry on line {line_number}")
+            name, value = line.split("=", 1)
+            name = name.strip()
+            value = value.strip()
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                raise ValueError(f"Invalid .env variable name on line {line_number}")
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                value = value[1:-1]
+            elif " #" in value:
+                value = value.split(" #", 1)[0].rstrip()
+            os.environ.setdefault(name, value)
+
+
 def deep_merge(default: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     result = copy.deepcopy(default)
     for key, value in override.items():
@@ -750,6 +776,7 @@ def validate_health(health: dict[str, Any], loader_name: str) -> None:
 
 
 def load_configuration(path: Path) -> tuple[dict[str, Any], list[tuple[dict[str, Any], dict[str, Any]]]]:
+    load_dotenv(path.parent / ".env")
     with path.open("r", encoding="utf-8") as stream:
         config = expand_environment(yaml.safe_load(stream))
     if not isinstance(config, dict) or not isinstance(config.get("loaders"), list):
