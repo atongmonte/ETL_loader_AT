@@ -2,8 +2,11 @@
 
 This loader reads the daily Cardinal `Invoice Level` Excel worksheet from
 `\\montefiore.org\centralfiles\data\Procurement PMO\_Data\CARDINAL\INBOUND`
-and atomically refreshes `cardinal.dbo.CARDINAL_INV_DETAILS` on
+and atomically appends to `cardinal.dbo.CARDINAL_INV_DETAILS` on
 `YNBBSTVWP02\PROCDATASRVPROD`.
+
+The loader is scheduled as a daily process, and its ETL health records use
+`ProcessFrequency = Daily`.
 
 This version has three Python files:
 
@@ -168,7 +171,7 @@ health:
   schema: dbo
   table: ETL_Health_Status
   required: true
-  process_frequency: OnDemand
+  process_frequency: Daily
   owner: ETL Owner
 
 loaders:

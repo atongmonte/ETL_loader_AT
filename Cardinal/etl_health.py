@@ -196,7 +196,7 @@ def record_legacy_status(
         "LogFilePath": str(log_file_path),
         "STGTableName": staging_name[:255] if staging_name else None,
         "ProcessFrequency": loader_health.get("process_frequency")
-        or health_config.get("process_frequency", "OnDemand"),
+        or health_config.get("process_frequency", "Daily"),
         "Error": result.get("error"),
         "Owner": loader_health.get("owner") or health_config.get("owner"),
     }
