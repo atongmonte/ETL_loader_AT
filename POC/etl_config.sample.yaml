@@ -28,7 +28,7 @@ health:
   table: ETL_Health_Status
   required: false
   process_frequency: OnDemand
-  owner: ETL Owner
+  owner: Andrew Tong
 
 email:
   enabled: false
