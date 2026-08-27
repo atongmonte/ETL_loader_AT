@@ -1,0 +1,133 @@
+version: 1
+
+default_destination:
+  connection:
+    dialect: mssql+pyodbc
+    driver: ODBC Driver 17 for SQL Server
+    server: 'YNBBSTVWP02\PROCDATASRVPROD'
+    database: cardinal
+    auth: {mode: trusted}
+    encrypt: true
+    trust_server_certificate: true
+  schema: dbo
+
+health:
+  enabled: true
+  connection:
+    dialect: mssql+pyodbc
+    driver: ODBC Driver 17 for SQL Server
+    server: 'YNBBSTVWP02\PROCDATASRVPROD'
+    database: ETL
+    auth: {mode: trusted}
+    encrypt: true
+    trust_server_certificate: true
+  schema: dbo
+  table: ETL_Health_Status
+  required: true
+  process_frequency: Daily
+  owner: Andrew Tong
+
+email:
+  enabled: true
+  required: false
+  tenant_id: "${GRAPH_TENANT_ID:-}"
+  client_id: "${GRAPH_CLIENT_ID:-}"
+  client_secret: "${GRAPH_CLIENT_SECRET:-}"
+  sender: procurementdatateam@montefiore.org
+  recipients: [atong@montefiore.org]
+  cc: []
+  subject_prefix: Cardinal invoice details ETL summary
+  timeout_seconds: 30
+  save_to_sent_items: false
+
+loaders:
+  - name: CardinalInvoiceDetails
+    enabled: true
+    health:
+      data_flow_task_name: Excel_to_SQL_Append
+    source:
+      type: excel
+      path: '\\montefiore.org\centralfiles\data\Procurement PMO\_Data\CARDINAL\INBOUND'
+      filename_pattern: 'Montefiore_Purchase Invoice Detail Report_Daily{date:%Y-%m-%d}-*.xlsx'
+      file_move:
+        success_directory: '\\montefiore.org\centralfiles\data\Procurement PMO\_Data\CARDINAL\ARCHIVE'
+        error_directory: '\\montefiore.org\centralfiles\data\Procurement PMO\_Data\CARDINAL\ERRORS'
+      options:
+        sheet_name: Invoice Level
+        dtype: string
+        keep_default_na: false
+        skipfooter: 1
+
+    destination:
+      table: CARDINAL_INV_DETAILS
+
+    direct_load:
+      strategy: append
+      batch_size: 10000
+      allow_empty: false
+      pk_check: []
+
+    columns:
+      - {source: Month Year Display Text, target: MONTH_YEAR_SOURCE, type: "varchar(8)", nullable: true}
+      - {source: Ship To Customer Number, target: ACCOUNT_NUM, type: "varchar(10)", nullable: true}
+      - {source: Acct Type, target: ACCOUNT_TYPE, type: "varchar(4)", nullable: true}
+      - {source: Ship To Customer Name, target: ACCOUNT_NAME, type: "varchar(100)", nullable: true}
+      - {source: Site, target: SITE, type: "varchar(50)", nullable: true}
+      - {source: Customer classification Description, target: ACCOUNT_CLASSIFICATION_DESC, type: "varchar(50)", nullable: true}
+      - {source: Material Number (Numeric), target: CIN_NUM, type: "varchar(7)", nullable: true}
+      - {source: Material Description, target: PRODUCT_DESCRIPTION, type: "varchar(max)", nullable: true}
+      - {source: Misc Product Attributes.Trade Name, target: TRADE_NAME, type: "varchar(100)", nullable: true}
+      - {source: Generic Name Type, target: GENERIC_NAME, type: "varchar(255)", nullable: true}
+      - {source: Strength, target: STRENGTH, type: "varchar(50)", nullable: true}
+      - {source: Size/dimensions, target: SIZE_DIMENSION, type: "varchar(50)", nullable: true}
+      - {source: Form, target: FORM, type: "varchar(10)", nullable: true}
+      - {source: Pack Qty, target: PACK_QTY, type: "numeric(18,2)", nullable: true}
+      - {source: Pack Size, target: PACK, type: "numeric(18,2)", nullable: true}
+      - {source: Vendor Name, target: VENDOR_NAME, type: "varchar(max)", nullable: true}
+      - {source: NDC 11, target: NDC_NUM, type: "varchar(11)", nullable: true}
+      - {source: UPC Number, target: UPC_NUM, type: "varchar(20)", nullable: true}
+      - {source: Cardinal Key, target: CARDINAL_KEY, type: "varchar(9)", nullable: true}
+      - {source: Cardinal Substitution Key, target: CARDINAL_SUBSTITUTION_KEY, type: "varchar(8)", nullable: true}
+      - {source: GCN Sequence Number, target: GCN_SEQ_NUM, type: "varchar(6)", nullable: true}
+      - {source: Genric Product Id, target: GENRIC_PRODUCT_ID, type: "varchar(14)", nullable: true}
+      - {source: Manufacturer Part Number, target: MFR_PART_NUM, type: "varchar(255)", nullable: true}
+      - {source: UOI, target: UOI, type: "numeric(18,2)", nullable: true}
+      - {source: Base Unit Of Measure, target: BASE_UOM, type: "varchar(5)", nullable: true}
+      - {source: MDSP UOM, target: MDSP_UOM, type: "varchar(5)", nullable: true}
+      - {source: Packaging Indicator, target: PACKAGING_INDICATOR, type: "varchar(2)", nullable: true}
+      - {source: OE Cat Code2, target: OE_CAT_CODE2, type: "varchar(100)", nullable: true}
+      - {source: Shape, target: SHAPE, type: "varchar(50)", nullable: true}
+      - {source: Color, target: COLOR, type: "varchar(50)", nullable: true}
+      - {source: Refrig Flag, target: REFRIG_FLAG, type: "varchar(1)", nullable: true}
+      - {source: Temperature conditions indicator, target: TEMP_CONDT_INDICATOR, type: "varchar(3)", nullable: true}
+      - {source: Temperature conditions indicator descriptions, target: TEMP_CONDT_INDICATOR_DESC, type: "varchar(100)", nullable: true}
+      - {source: AHFS Code, target: AHFS_CODE, type: "varchar(8)", nullable: true}
+      - {source: AHFS Code Description, target: AHFS_CODE_DESC, type: "varchar(255)", nullable: true}
+      - {source: Fine Class, target: FINE_CLASS, type: "varchar(4)", nullable: true}
+      - {source: Fine Class Description, target: FINE_CLASS_DESC, type: "varchar(255)", nullable: true}
+      - {source: Finer Class, target: FINER_CLASS, type: "varchar(4)", nullable: true}
+      - {source: Finer Class Description, target: FINER_CLASS_DESC, type: "varchar(255)", nullable: true}
+      - {source: Finest Class, target: FINEST_CLASS, type: "varchar(4)", nullable: true}
+      - {source: Finest Class Description, target: FINEST_CLASS_DESC, type: "varchar(255)", nullable: true}
+      - {source: DEA Schedule1, target: DEA_SCHEDULE1, type: "varchar(2)", nullable: true}
+      - {source: Rx Product Flag, target: RX_PROD_FLAG, type: "varchar(2)", nullable: true}
+      - {source: Material Group, target: MATERIAL_GROUP, type: "varchar(10)", nullable: true}
+      - {source: SPD Flag, target: SPD_FLAG, type: "varchar(1)", nullable: true}
+      - {source: Buying Group, target: BUYING_GROUP, type: "varchar(8)", nullable: true}
+      - {source: Buying Group Name, target: BUYING_GROUP_NAME, type: "varchar(255)", nullable: true}
+      - {source: Cust Purchase Order Type Desc, target: CUST_PO_TYPE_DESC, type: "varchar(100)", nullable: true}
+      - {source: Billing Type Description, target: BILLING_TYPE_DESC, type: "varchar(100)", nullable: true}
+      - {source: Sales Document, target: SALES_DOCUMENT, type: "varchar(10)", nullable: true}
+      - {source: Customer Purchase Order Number, target: PO_NUM, type: "varchar(255)", nullable: true}
+      - {source: Order Document Date, target: ORDER_DATE, type: date, nullable: true}
+      - {source: Billing Date, target: INVOICE_DATE, type: date, nullable: true}
+      - {source: Invoice Number, target: INVOICE_NUMBER, type: "varchar(10)", nullable: true}
+      - {source: Cum. Order Qty In Sales Units, target: ORDER_QTY, type: "numeric(18,2)", nullable: true}
+      - {source: Actual Invoice Quantity, target: ACTUAL_INVOICE_QTY, type: "numeric(18,2)", nullable: true}
+      - {source: Unit Price, target: UNIT_PRICE, type: money, nullable: true}
+      - {source: UOI Price, target: UOI_PRICE, type: money, nullable: true}
+      - {source: Pricing Subtotal 2 - Net Price after Promotions, target: PRICING_SUBTOTAL_2_NET_PRICE_AFTER_PROMOTIONS, type: money, nullable: true}
+      - {source: Tax Amount In Document Currency, target: TAX_AMT_IN_DOC_CURRENCY, type: money, nullable: true}
+      - {source: Total Dollars, target: TOTAL_DOLLARS, type: money, nullable: true}
+      - {source: Month Year Display Text, target: YEAR_MONTH, type: "varchar(7)", nullable: true, generated: year_month}
+      - {target: Load_TS, type: "datetime2(2)", nullable: true, generated: load_timestamp}
