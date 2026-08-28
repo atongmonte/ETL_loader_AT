@@ -33,6 +33,22 @@ py -3.12 .\main_loader.py --config .\etl_config.yaml
 
 `--validate-only` checks YAML without accessing source files, databases, or the shared log folder. `--preflight` reads and validates the complete source plus live production metadata without writing anything. `--table-info` prints the live production columns and generated-column status. Add `--loader LoaderName` to limit either live read-only command to one loader.
 
+### Batch file
+
+From Command Prompt or PowerShell, the included batch file runs the production loader using the Cardinal virtual environment, YAML, and automatically loaded `.env`:
+
+```bat
+run_cardinal_loader.bat
+```
+
+It also passes optional command-line arguments to the loader. Use this command for a read-only configuration test:
+
+```bat
+run_cardinal_loader.bat --validate-only
+```
+
+The batch file returns the loader's exit code to the calling console or scheduler.
+
 ## Windows Task Scheduler
 
 Task Scheduler should call the virtual environment's Python executable directly. It does not need to activate the virtual environment or start PowerShell/CMD.
